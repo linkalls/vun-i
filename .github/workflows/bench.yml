@@ -24,6 +24,16 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2.2.0
 
+      - name: Show environment info
+        shell: powershell
+        run: |
+          "runner.os=$env:RUNNER_OS" | Tee-Object -FilePath env-info.txt
+          "runner.arch=$env:RUNNER_ARCH" | Tee-Object -FilePath env-info.txt -Append
+          "ImageOS=$env:ImageOS" | Tee-Object -FilePath env-info.txt -Append
+          "ImageVersion=$env:ImageVersion" | Tee-Object -FilePath env-info.txt -Append
+          "bun_version=$(bun --version)" | Tee-Object -FilePath env-info.txt -Append
+          "v_version=$(v version)" | Tee-Object -FilePath env-info.txt -Append
+
       - name: Generate dummy package.json
         shell: powershell
         run: |
@@ -38,32 +48,75 @@ jobs:
           }
           '@ | Set-Content -Path package.json
 
-      - name: Benchmark bun isolated install
-        shell: powershell
-        run: |
-          $bunResult = Measure-Command { bun install --linker isolated }
-          "bun install --linker isolated: $($bunResult.TotalMilliseconds) ms" | Tee-Object -FilePath bun-benchmark.txt
-          if (Test-Path node_modules) {
-            Remove-Item -Recurse -Force node_modules
-          }
-          if (Test-Path bun.lock) {
-            Remove-Item -Force bun.lock
-          }
-
       - name: Compile vun-i
         run: v -prod -o vun.exe .
 
-      - name: Benchmark vun-i
+      - name: Benchmark cold installs
         shell: powershell
         run: |
-          $vunResult = Measure-Command { .\vun.exe }
-          "vun-i: $($vunResult.TotalMilliseconds) ms" | Tee-Object -FilePath vun-benchmark.txt
+          $results = @()
+
+          if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
+          if (Test-Path bun.lock) { Remove-Item -Force bun.lock }
+          $bunCold = Measure-Command { bun install --linker isolated }
+          $results += [pscustomobject]@{ tool = 'bun'; mode = 'cold'; milliseconds = [math]::Round($bunCold.TotalMilliseconds, 4) }
+
+          if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
+          if (Test-Path bun.lock) { Remove-Item -Force bun.lock }
+          $vunCold = Measure-Command { .\vun.exe }
+          $results += [pscustomobject]@{ tool = 'vun-i'; mode = 'cold'; milliseconds = [math]::Round($vunCold.TotalMilliseconds, 4) }
+
+          $results | ConvertTo-Json | Set-Content cold-benchmark.json
+          $results | ForEach-Object { "{0} {1}: {2} ms" -f $_.tool, $_.mode, $_.milliseconds } | Tee-Object -FilePath cold-benchmark.txt
+
+      - name: Benchmark warm installs (3 runs)
+        shell: powershell
+        run: |
+          $results = @()
+
+          bun install --linker isolated | Out-Null
+          for ($i = 1; $i -le 3; $i++) {
+            if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
+            $time = Measure-Command { bun install --linker isolated }
+            $results += [pscustomobject]@{ tool = 'bun'; mode = 'warm'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
+          }
+
+          .\vun.exe | Out-Null
+          for ($i = 1; $i -le 3; $i++) {
+            if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
+            if (Test-Path bun.lock) { Remove-Item -Force bun.lock }
+            $time = Measure-Command { .\vun.exe }
+            $results += [pscustomobject]@{ tool = 'vun-i'; mode = 'warm'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
+          }
+
+          $results | ConvertTo-Json | Set-Content warm-benchmark.json
+          $results | ForEach-Object { "{0} {1} run#{2}: {3} ms" -f $_.tool, $_.mode, $_.run, $_.milliseconds } | Tee-Object -FilePath warm-benchmark.txt
+
+          $summary = $results | Group-Object tool | ForEach-Object {
+            $vals = $_.Group.milliseconds
+            $avg = ($vals | Measure-Object -Average).Average
+            $min = ($vals | Measure-Object -Minimum).Minimum
+            $max = ($vals | Measure-Object -Maximum).Maximum
+            [pscustomobject]@{
+              tool = $_.Name
+              avg_ms = [math]::Round($avg, 4)
+              min_ms = [math]::Round($min, 4)
+              max_ms = [math]::Round($max, 4)
+            }
+          }
+          $summary | ConvertTo-Json | Set-Content benchmark-summary.json
+          $summary | ForEach-Object { "{0} avg={1} ms min={2} ms max={3} ms" -f $_.tool, $_.avg_ms, $_.min_ms, $_.max_ms } | Tee-Object -FilePath benchmark-summary.txt
 
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v7
         with:
           name: benchmark-results
           path: |
-            bun-benchmark.txt
-            vun-benchmark.txt
+            env-info.txt
+            cold-benchmark.txt
+            cold-benchmark.json
+            warm-benchmark.txt
+            warm-benchmark.json
+            benchmark-summary.txt
+            benchmark-summary.json
             bun.lock
