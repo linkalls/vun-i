@@ -1,0 +1,33 @@
+name: Benchmark vun-i
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  benchmark:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup V
+        uses: vlang/setup-v@v1
+        with:
+          check-latest: true
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+      - name: Generate dummy package.json
+        run: |
+          echo '{"dependencies": {"zod": "3.24.1", "hono": "4.6.17", "valibot": "0.42.1"}}' > package.json
+      - name: Benchmark Bun
+        shell: powershell
+        run: |
+          Measure-Command { bun install }
+          Remove-Item -Recurse -Force node_modules
+      - name: Compile vun-i
+        run: v -prod -o vun.exe vun.v
+      - name: Benchmark vun-i
+        shell: powershell
+        run: |
+          Measure-Command { .\vun.exe }
