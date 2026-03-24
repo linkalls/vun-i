@@ -38,11 +38,11 @@ jobs:
           }
           '@ | Set-Content -Path package.json
 
-      - name: Benchmark bun install
+      - name: Benchmark bun isolated install
         shell: powershell
         run: |
-          $bunResult = Measure-Command { bun install }
-          "bun install: $($bunResult.TotalMilliseconds) ms" | Tee-Object -FilePath bun-benchmark.txt
+          $bunResult = Measure-Command { bun install --linker isolated }
+          "bun install --linker isolated: $($bunResult.TotalMilliseconds) ms" | Tee-Object -FilePath bun-benchmark.txt
           if (Test-Path node_modules) {
             Remove-Item -Recurse -Force node_modules
           }

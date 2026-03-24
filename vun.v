@@ -102,6 +102,7 @@ fn main() {
 fn prepare_node_modules() ! {
 	os.mkdir_all('node_modules')!
 	os.mkdir_all(os.join_path('node_modules', bun_store_dir))!
+	os.mkdir_all(hidden_store_node_modules_dir())!
 }
 
 fn read_package_json(path string) !PackageJson {
@@ -303,6 +304,7 @@ fn install_store_package(mut ctx InstallContext, cache_dir string, pkg ResolvedP
 		link_package_dir(source_dir, target_dir)!
 	}
 
+	link_hidden_store_dependency(pkg)!
 	installed[store_key] = true
 
 	for dep_name, dep_spec in pkg.dependencies {
@@ -315,31 +317,57 @@ fn install_store_package(mut ctx InstallContext, cache_dir string, pkg ResolvedP
 }
 
 fn link_store_dependency(parent ResolvedPackage, child ResolvedPackage) ! {
-	parent_node_modules := os.join_path(store_package_root(parent), 'node_modules')
-	dest := os.join_path(parent_node_modules, child.name)
+	mut dest := os.join_path(store_node_modules_dir(parent), child.name)
+	if child.name == parent.name {
+		dest = os.join_path(store_node_modules_dir(parent), 'node_modules', child.name)
+	}
 	target := relative_path(os.dir(dest), store_package_target(child))
-	ensure_symlink(target, dest)!
+	ensure_package_link(target, store_package_target(child), dest)!
+}
+
+fn link_hidden_store_dependency(pkg ResolvedPackage) ! {
+	dest := os.join_path(hidden_store_node_modules_dir(), pkg.name)
+	target := relative_path(os.dir(dest), store_package_target(pkg))
+	ensure_package_link(target, store_package_target(pkg), dest)!
 }
 
 fn link_root_dependency(pkg ResolvedPackage) ! {
 	dest := os.join_path('node_modules', pkg.name)
 	target := relative_path(os.dir(dest), store_package_target(pkg))
-	ensure_symlink(target, dest)!
+	ensure_package_link(target, store_package_target(pkg), dest)!
 }
 
-fn ensure_symlink(target string, dest string) ! {
+fn ensure_package_link(target string, fallback_target string, dest string) ! {
 	if os.exists(dest) || os.is_link(dest) {
 		os.rm(dest) or { os.rmdir_all(dest) or {} }
 	}
 	os.mkdir_all(os.dir(dest))!
-	os.symlink(target, dest) or {
-		link_path_recursive(store_package_target_from_dest(dest, target), dest)!
+	if try_symlink_or_junction(target, fallback_target, dest) {
+		return
 	}
+	link_path_recursive(fallback_target, dest)!
 }
 
-fn store_package_target_from_dest(dest string, target string) string {
-	base := os.real_path(os.dir(dest))
-	return os.join_path(base, target)
+fn try_symlink_or_junction(target string, fallback_target string, dest string) bool {
+	os.symlink(target, dest) or {
+		if os.user_os() == 'windows' {
+			junction_cmd := 'cmd /c mklink /J "${dest}" "${windows_abs_path(fallback_target)}"'
+			junction_result := os.execute(junction_cmd)
+			if junction_result.exit_code == 0 {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+fn windows_abs_path(path string) string {
+	if os.is_abs_path(path) {
+		return path
+	}
+	base := os.getwd()
+	return os.join_path(base, path)
 }
 
 fn link_package_dir(src_dir string, dest_dir string) ! {
@@ -459,12 +487,20 @@ fn store_folder_name(pkg ResolvedPackage) string {
 	return store_key_for(pkg)
 }
 
+fn hidden_store_node_modules_dir() string {
+	return os.join_path('node_modules', bun_store_dir, 'node_modules')
+}
+
 fn store_package_root(pkg ResolvedPackage) string {
 	return os.join_path('node_modules', bun_store_dir, store_folder_name(pkg))
 }
 
+fn store_node_modules_dir(pkg ResolvedPackage) string {
+	return os.join_path(store_package_root(pkg), 'node_modules')
+}
+
 fn store_package_target(pkg ResolvedPackage) string {
-	return os.join_path(store_package_root(pkg), 'node_modules', pkg.name)
+	return os.join_path(store_node_modules_dir(pkg), pkg.name)
 }
 
 fn resolved_by_exact_key(ctx InstallContext, name string, spec string) !ResolvedPackage {
