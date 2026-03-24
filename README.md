@@ -136,13 +136,13 @@ Real confidence should come from heavier trees like:
 ### Build
 
 ```bash
-v -prod -o vun.exe vun.v
+v -prod -o vun.exe .
 ```
 
 On Unix-like systems:
 
 ```bash
-v -prod -o vun vun.v
+v -prod -o vun .
 ```
 
 ### Run
@@ -150,26 +150,33 @@ v -prod -o vun vun.v
 Inside a project directory with a `package.json`:
 
 ```bash
-./vun
+./vun [flags]
 ```
 
-or on Windows:
+### Flags
 
-```powershell
-.\vun.exe
-```
+- `--sync-bun-lock` / `--bun-compat`: Runs `bun install --lockfile-only` after installation to sync Bun's lockfile. (Off by default for maximum speed)
+- `--sync-npm-lock`: Runs `npm install --package-lock-only` after installation.
+- `--version`: Show version.
+- `--help`: Show help.
 
-What it does:
+### Default Mode: Speed First
 
-1. resolves dependencies from npm registry
-2. downloads/extracts package tarballs
-3. builds Bun-like isolated store layout in `node_modules/.bun`
-4. links root packages and bins
-5. runs:
+By default, `vun-i` focuses on **raw installation speed**:
+1. Resolves dependencies from npm registry.
+2. Downloads and extracts tarballs in parallel.
+3. Builds a Bun-like isolated store layout in `node_modules/.bun` using hardlinks.
+4. Links root packages and bins.
 
-```bash
-bun install --lockfile-only
-```
+It **does not** sync lockfiles by default. If you need a `bun.lock` or `package-lock.json`, use the respective flags.
+
+---
+
+## Why Speed Mode?
+
+The original goal of `vun-i` is to solve Windows NTFS performance bottlenecks. By making lockfile synchronization optional, we achieve:
+- **True-cold installs** that can be faster than Bun.
+- **Minimal overhead** for development environments where the node_modules structure is more important than the lockfile metadata during rapid prototyping.
 
 ---
 

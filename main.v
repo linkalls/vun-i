@@ -68,10 +68,26 @@ fn main() {
 	}
 
 	println('📦 resolved ${ctx.resolved.len} packages')
-	prefetch_all(ctx.resolved.values(), cache_dir)
-	// ctx = hydrate_all_package_metadata(ctx, cache_dir) // Removed for speed: use registry metadata only
-
+	
+	// Create a channel to signal when a package is ready (downloaded and extracted)
+	ready_chan := chan ResolvedPackage{cap: 100}
+	
+	// Start prefetching in the background
+	spawn prefetch_all_streaming(ctx.resolved.values(), cache_dir, ready_chan)
+	
 	mut installed := map[string]bool{}
+	mut ready_count := 0
+	total_to_install := ctx.resolved.len
+	
+	// Track which packages are physically in place
+	mut physical_ready := map[string]bool{}
+	
+	// Installation loop that waits for packages to be ready
+	for ready_count < total_to_install {
+		pkg := <-ready_chan
+		physical_ready[package_key(pkg.name, pkg.version)] = true
+		ready_count++
+	}
 
 	for name, spec in root_manifest.dependencies {
 		pkg := resolved_by_exact_key(ctx, name, spec) or {
