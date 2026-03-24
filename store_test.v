@@ -2,12 +2,12 @@ module main
 
 fn test_relative_path_basic() {
 	got := relative_path('node_modules/.bun/react@1.0.0/node_modules', 'node_modules/.bun/scheduler@1.0.0/node_modules/scheduler')
-	assert got == '../../scheduler@1.0.0/node_modules/scheduler'
+	assert normalize_sep(got) == '../../scheduler@1.0.0/node_modules/scheduler'
 }
 
 fn test_relative_path_scoped_package() {
 	got := relative_path('node_modules/.bun/@scope+pkg@1.0.0/node_modules/@scope', 'node_modules/.bun/@scope+dep@2.0.0/node_modules/@scope/dep')
-	assert got == '../../../@scope+dep@2.0.0/node_modules/@scope/dep'
+	assert normalize_sep(got) == '../../../@scope+dep@2.0.0/node_modules/@scope/dep'
 }
 
 fn test_peer_hash_suffix_is_stable() {

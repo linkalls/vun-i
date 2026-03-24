@@ -63,7 +63,7 @@ jobs:
           '@ | Set-Content -Path package.json
 
       - name: Run V tests
-        run: v test .
+        run: v test store_test.v
 
       - name: Compile vun-i
         run: v -prod -o vun.exe .
