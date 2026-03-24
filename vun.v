@@ -7,7 +7,7 @@ import sync
 import time
 
 const registry_url = 'https://registry.npmjs.org'
-const cache_root_name = '.vun-cache'
+const bun_cache_suffix = '.bun/install/cache'
 
 struct PackageJson {
 	dependencies map[string]string
@@ -50,7 +50,7 @@ fn main() {
 		return
 	}
 
-	cache_dir := os.join_path(os.home_dir(), cache_root_name)
+	cache_dir := bun_cache_dir()
 	os.mkdir_all(cache_dir) or {
 		eprintln('❌ failed to create cache dir ${cache_dir}: ${err.msg()}')
 		return
@@ -245,8 +245,7 @@ fn prefetch_package(pkg ResolvedPackage, cache_dir string, mut wg sync.WaitGroup
 	}
 
 	cache_pkg_dir := package_cache_dir(cache_dir, pkg)
-	package_dir := os.join_path(cache_pkg_dir, 'package')
-	if os.exists(package_dir) {
+	if os.exists(os.join_path(cache_pkg_dir, 'package.json')) {
 		println('♻️ cache hit ${pkg.name}@${pkg.version}')
 		return
 	}
@@ -262,7 +261,7 @@ fn prefetch_package(pkg ResolvedPackage, cache_dir string, mut wg sync.WaitGroup
 		return
 	}
 
-	cmd := 'tar -xzf "${tar_path}" -C "${cache_pkg_dir}"'
+	cmd := 'tar -xzf "${tar_path}" --strip-components=1 -C "${cache_pkg_dir}"'
 	result := os.execute(cmd)
 	if result.exit_code != 0 {
 		eprintln('failed to extract ${pkg.name}@${pkg.version}: ${result.output}')
@@ -286,7 +285,7 @@ fn install_package_recursive(ctx InstallContext, cache_dir string, pkg ResolvedP
 	}
 	seen[seen_key] = true
 
-	src_dir := os.join_path(package_cache_dir(cache_dir, pkg), 'package')
+	src_dir := package_cache_dir(cache_dir, pkg)
 	dest_dir := os.join_path(target_node_modules, pkg.name)
 	link_package_dir(src_dir, dest_dir)!
 
@@ -348,9 +347,26 @@ fn package_key(name string, spec string) string {
 	return '${name}@${spec}'
 }
 
+fn bun_cache_dir() string {
+	custom_cache := os.getenv('BUN_INSTALL_CACHE_DIR')
+	if custom_cache != '' {
+		return custom_cache
+	}
+	return os.join_path(os.home_dir(), bun_cache_suffix)
+}
+
 fn package_cache_dir(cache_dir string, pkg ResolvedPackage) string {
-	safe_name := pkg.name.replace('/', '__')
-	return os.join_path(cache_dir, '${safe_name}@${pkg.version}')
+	return os.join_path(cache_dir, bun_cache_folder_name(pkg))
+}
+
+fn bun_cache_folder_name(pkg ResolvedPackage) string {
+	if pkg.name.starts_with('@') {
+		parts := pkg.name.split('/')
+		if parts.len == 2 {
+			return os.join_path(parts[0], '${parts[1]}@${pkg.version}@@@1')
+		}
+	}
+	return '${pkg.name}@${pkg.version}@@@1'
 }
 
 fn resolved_by_exact_key(ctx InstallContext, name string, spec string) !ResolvedPackage {
