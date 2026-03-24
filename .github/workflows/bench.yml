@@ -27,9 +27,6 @@ jobs:
       - name: Setup pnpm
         run: corepack enable pnpm
 
-      - name: Setup Yarn
-        run: corepack enable yarn
-
       - name: Show environment info
         shell: powershell
         run: |
@@ -42,17 +39,15 @@ jobs:
           "node_version=$(node --version)" | Tee-Object -FilePath env-info.txt -Append
           "npm_version=$(npm --version)" | Tee-Object -FilePath env-info.txt -Append
           "pnpm_version=$(pnpm --version)" | Tee-Object -FilePath env-info.txt -Append
-          "yarn_version=$(yarn --version)" | Tee-Object -FilePath env-info.txt -Append
           "bun_cache=$env:USERPROFILE\.bun\install\cache" | Tee-Object -FilePath env-info.txt -Append
 
-      - name: Generate dummy package.json
+      - name: Generate benchmark fixture
         shell: powershell
         run: |
           @'
           {
             "name": "bench-fixture",
             "private": true,
-            "packageManager": "pnpm@10.17.1",
             "dependencies": {
               "zod": "^4.3.6",
               "hono": "^4.12.9",
@@ -79,7 +74,6 @@ jobs:
             if (Test-Path bun.lock) { Remove-Item -Force bun.lock }
             if (Test-Path package-lock.json) { Remove-Item -Force package-lock.json }
             if (Test-Path pnpm-lock.yaml) { Remove-Item -Force pnpm-lock.yaml }
-            if (Test-Path yarn.lock) { Remove-Item -Force yarn.lock }
             if (Test-Path $bunCache) { Remove-Item -Recurse -Force $bunCache }
             $time = Measure-Command { bun install --linker isolated }
             $results += [pscustomobject]@{ tool = 'bun'; mode = 'true-cold'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
@@ -105,13 +99,6 @@ jobs:
             if (Test-Path pnpm-lock.yaml) { Remove-Item -Force pnpm-lock.yaml }
             $time = Measure-Command { pnpm install }
             $results += [pscustomobject]@{ tool = 'pnpm'; mode = 'true-cold'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
-          }
-
-          for ($i = 1; $i -le 3; $i++) {
-            if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
-            if (Test-Path yarn.lock) { Remove-Item -Force yarn.lock }
-            $time = Measure-Command { yarn install }
-            $results += [pscustomobject]@{ tool = 'yarn'; mode = 'true-cold'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
           }
 
           $results | ConvertTo-Json | Set-Content true-cold-benchmark.json
@@ -149,13 +136,6 @@ jobs:
             if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
             $time = Measure-Command { pnpm install }
             $results += [pscustomobject]@{ tool = 'pnpm'; mode = 'warm'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
-          }
-
-          yarn install | Out-Null
-          for ($i = 1; $i -le 3; $i++) {
-            if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
-            $time = Measure-Command { yarn install }
-            $results += [pscustomobject]@{ tool = 'yarn'; mode = 'warm'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
           }
 
           $results | ConvertTo-Json | Set-Content warm-benchmark.json
@@ -202,4 +182,3 @@ jobs:
             bun.lock
             package-lock.json
             pnpm-lock.yaml
-            yarn.lock
