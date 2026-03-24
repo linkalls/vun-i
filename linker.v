@@ -24,9 +24,7 @@ fn link_root_dependency(installed_pkg InstalledPackage) ! {
 }
 
 fn ensure_package_link(target string, fallback_target string, dest string) ! {
-	if os.exists(dest) || os.is_link(dest) {
-		os.rm(dest) or { os.rmdir_all(dest) or {} }
-	}
+	remove_existing_path(dest)
 	os.mkdir_all(os.dir(dest))!
 	if try_symlink_or_junction(target, fallback_target, dest) {
 		return
@@ -35,9 +33,7 @@ fn ensure_package_link(target string, fallback_target string, dest string) ! {
 }
 
 fn ensure_file_link(target string, fallback_target string, dest string) ! {
-	if os.exists(dest) || os.is_link(dest) {
-		os.rm(dest) or { os.rmdir_all(dest) or {} }
-	}
+	remove_existing_path(dest)
 	os.mkdir_all(os.dir(dest))!
 	if try_symlink_or_junction(target, fallback_target, dest) {
 		return
@@ -64,6 +60,13 @@ fn windows_abs_path(path string) string {
 		return path
 	}
 	return os.join_path(os.getwd(), path)
+}
+
+fn remove_existing_path(path string) {
+	if !(os.exists(path) || os.is_link(path)) {
+		return
+	}
+	os.rm(path) or { os.rmdir_all(path) or {} }
 }
 
 fn link_package_dir(src_dir string, dest_dir string) ! {
