@@ -1,5 +1,8 @@
 name: Benchmark vun-i
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 on:
   push:
     branches: [master, main]
@@ -11,15 +14,15 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup V
-        uses: vlang/setup-v@v1
+        uses: vlang/setup-v@v1.3
         with:
           check-latest: true
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@v2.2.0
 
       - name: Generate dummy package.json
         shell: powershell
@@ -57,7 +60,7 @@ jobs:
           "vun-i: $($vunResult.TotalMilliseconds) ms" | Tee-Object -FilePath vun-benchmark.txt
 
       - name: Upload benchmark artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-results
           path: |
