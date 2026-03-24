@@ -5,6 +5,7 @@ import net.http
 import os
 import sync
 import time
+import x.json2
 
 const registry_url = 'https://registry.npmjs.org'
 const bun_store_dir = '.bun'
@@ -19,10 +20,12 @@ struct NpmRegistry {
 }
 
 struct NpmVersion {
-	name         string
-	version      string
-	dist         NpmDist
-	dependencies map[string]string
+	name              string
+	version           string
+	dist              NpmDist
+	dependencies      map[string]string
+	peer_dependencies map[string]string @[json: 'peerDependencies']
+	bin               map[string]string
 }
 
 struct NpmDist {
@@ -30,15 +33,23 @@ struct NpmDist {
 }
 
 struct ResolvedPackage {
-	name         string
-	version      string
-	tarball      string
-	dependencies map[string]string
+	name              string
+	version           string
+	tarball           string
+	dependencies      map[string]string
+	peer_dependencies map[string]string
+	bin               map[string]string
 }
 
 struct InstallContext {
 mut:
-	resolved map[string]ResolvedPackage
+	root_dependencies map[string]ResolvedPackage
+	resolved          map[string]ResolvedPackage
+}
+
+struct InstalledPackage {
+	pkg   ResolvedPackage
+	peers map[string]ResolvedPackage
 }
 
 fn main() {
@@ -62,18 +73,21 @@ fn main() {
 	}
 
 	mut ctx := InstallContext{
-		resolved: map[string]ResolvedPackage{}
+		resolved:          map[string]ResolvedPackage{}
+		root_dependencies: map[string]ResolvedPackage{}
 	}
 
 	for name, spec in root_manifest.dependencies {
-		resolve_dependency(mut ctx, name, spec) or {
+		resolved := resolve_dependency(mut ctx, name, spec) or {
 			eprintln('❌ failed to resolve ${name}@${spec}: ${err.msg()}')
 			return
 		}
+		ctx.root_dependencies[name] = resolved
 	}
 
 	println('📦 resolved ${ctx.resolved.len} packages')
 	prefetch_all(ctx.resolved.values(), cache_dir)
+	ctx = hydrate_all_package_metadata(ctx, cache_dir)
 
 	mut installed := map[string]bool{}
 	for name, spec in root_manifest.dependencies {
@@ -83,12 +97,22 @@ fn main() {
 				return
 			}
 		}
-		install_store_package(mut ctx, cache_dir, pkg, mut installed) or {
+		root_peers := select_matching_peers(pkg.peer_dependencies, ctx.root_dependencies)
+		installed_pkg := InstalledPackage{
+			pkg:   pkg
+			peers: root_peers
+		}
+		providers := providers_for_child(ctx.root_dependencies, installed_pkg)
+		install_store_package(mut ctx, cache_dir, installed_pkg, providers, mut installed) or {
 			eprintln('❌ failed to install ${name}: ${err.msg()}')
 			return
 		}
-		link_root_dependency(pkg) or {
+		link_root_dependency(installed_pkg) or {
 			eprintln('❌ failed to link root dependency ${name}: ${err.msg()}')
+			return
+		}
+		link_root_bins(installed_pkg) or {
+			eprintln('❌ failed to link root bins for ${name}: ${err.msg()}')
 			return
 		}
 	}
@@ -103,6 +127,7 @@ fn prepare_node_modules() ! {
 	os.mkdir_all('node_modules')!
 	os.mkdir_all(os.join_path('node_modules', bun_store_dir))!
 	os.mkdir_all(hidden_store_node_modules_dir())!
+	os.mkdir_all(os.join_path('node_modules', '.bin'))!
 }
 
 fn read_package_json(path string) !PackageJson {
@@ -124,10 +149,12 @@ fn resolve_dependency(mut ctx InstallContext, name string, spec string) !Resolve
 	}
 
 	resolved := ResolvedPackage{
-		name:         name
-		version:      version
-		tarball:      version_meta.dist.tarball
-		dependencies: version_meta.dependencies.clone()
+		name:              name
+		version:           version
+		tarball:           version_meta.dist.tarball
+		dependencies:      version_meta.dependencies.clone()
+		peer_dependencies: version_meta.peer_dependencies.clone()
+		bin:               version_meta.bin.clone()
 	}
 	ctx.resolved[key] = resolved
 
@@ -179,6 +206,14 @@ fn version_matches_spec(version string, spec string) bool {
 	if trimmed == '*' || trimmed == 'latest' {
 		return true
 	}
+	if trimmed.contains('||') {
+		for part in trimmed.split('||') {
+			if version_matches_spec(version, part.trim_space()) {
+				return true
+			}
+		}
+		return false
+	}
 	if trimmed.starts_with('^') {
 		base := trimmed[1..]
 		v := parse_semver(version) or { return false }
@@ -205,6 +240,14 @@ fn version_matches_spec(version string, spec string) bool {
 		base := trimmed[2..]
 		return compare_semver(version, base) <= 0
 	}
+	if trimmed.starts_with('>') {
+		base := trimmed[1..]
+		return compare_semver(version, base) > 0
+	}
+	if trimmed.starts_with('<') {
+		base := trimmed[1..]
+		return compare_semver(version, base) < 0
+	}
 	return version == trimmed
 }
 
@@ -217,13 +260,16 @@ struct Semver {
 fn parse_semver(input string) !Semver {
 	core := input.split('-')[0]
 	parts := core.split('.')
-	if parts.len < 3 {
+	if parts.len == 0 || parts[0] == '' {
 		return error('invalid semver ${input}')
 	}
+	major := parts[0].int()
+	minor := if parts.len > 1 { parts[1].int() } else { 0 }
+	patch := if parts.len > 2 { parts[2].int() } else { 0 }
 	return Semver{
-		major: parts[0].int()
-		minor: parts[1].int()
-		patch: parts[2].int()
+		major: major
+		minor: minor
+		patch: patch
 	}
 }
 
@@ -289,52 +335,192 @@ fn prefetch_package(pkg ResolvedPackage, cache_dir string, mut wg sync.WaitGroup
 	println('⬇️ cached ${pkg.name}@${pkg.version}')
 }
 
-fn install_store_package(mut ctx InstallContext, cache_dir string, pkg ResolvedPackage, mut installed map[string]bool) ! {
-	store_key := store_key_for(pkg)
+fn hydrate_all_package_metadata(ctx InstallContext, cache_dir string) InstallContext {
+	mut next := ctx
+	for key, pkg in ctx.resolved {
+		next.resolved[key] = hydrate_package_metadata(pkg, cache_dir)
+	}
+	for name, pkg in ctx.root_dependencies {
+		next.root_dependencies[name] = hydrate_package_metadata(pkg, cache_dir)
+	}
+	return next
+}
+
+fn hydrate_package_metadata(pkg ResolvedPackage, cache_dir string) ResolvedPackage {
+	manifest_path := os.join_path(package_cache_dir(cache_dir, pkg), 'package.json')
+	if !os.exists(manifest_path) {
+		return pkg
+	}
+	data := os.read_file(manifest_path) or { return pkg }
+	manifest := json2.decode[json2.Any](data) or { return pkg }
+	peer_dependencies := json_map_string(manifest, 'peerDependencies')
+	bin := json_map_string(manifest, 'bin')
+	return ResolvedPackage{
+		...pkg
+		peer_dependencies: if peer_dependencies.len > 0 {
+			peer_dependencies
+		} else {
+			pkg.peer_dependencies
+		}
+		bin:               if bin.len > 0 { bin } else { pkg.bin }
+	}
+}
+
+fn json_map_string(value json2.Any, key string) map[string]string {
+	obj := value.as_map()
+	if key !in obj {
+		return map[string]string{}
+	}
+	entry := obj[key] or { return map[string]string{} }
+	mut out := map[string]string{}
+	if entry is string {
+		out[key] = entry
+		return out
+	}
+	entry_map := entry.as_map()
+	for entry_key, entry_value in entry_map {
+		if entry_value is string {
+			out[entry_key] = entry_value
+		}
+	}
+	return out
+}
+
+fn install_store_package(mut ctx InstallContext, cache_dir string, installed_pkg InstalledPackage, providers map[string]ResolvedPackage, mut installed map[string]bool) ! {
+	store_key := store_key_for(installed_pkg)
 	if store_key in installed {
 		return
 	}
 
-	package_root := store_package_root(pkg)
-	target_dir := store_package_target(pkg)
-	source_dir := package_cache_dir(cache_dir, pkg)
+	package_root := store_package_root(installed_pkg)
+	target_dir := store_package_target(installed_pkg)
+	source_dir := package_cache_dir(cache_dir, installed_pkg.pkg)
 
 	if !os.exists(target_dir) {
 		os.mkdir_all(os.join_path(package_root, 'node_modules'))!
 		link_package_dir(source_dir, target_dir)!
 	}
 
-	link_hidden_store_dependency(pkg)!
+	link_hidden_store_dependency(installed_pkg)!
+	link_bins_for_package(installed_pkg, providers)!
 	installed[store_key] = true
 
-	for dep_name, dep_spec in pkg.dependencies {
+	child_providers := providers_for_child(providers, installed_pkg)
+	for dep_name, dep_spec in installed_pkg.pkg.dependencies {
 		dep := resolved_by_exact_key(ctx, dep_name, dep_spec) or {
 			first_resolved_for_name(ctx, dep_name)!
 		}
-		install_store_package(mut ctx, cache_dir, dep, mut installed)!
-		link_store_dependency(pkg, dep)!
+		dep_peers := select_matching_peers(dep.peer_dependencies, child_providers)
+		child := InstalledPackage{
+			pkg:   dep
+			peers: dep_peers
+		}
+		install_store_package(mut ctx, cache_dir, child, child_providers, mut installed)!
+		link_store_dependency(installed_pkg, child)!
+	}
+
+	for peer_name, peer_pkg in installed_pkg.peers {
+		if peer_name == installed_pkg.pkg.name {
+			continue
+		}
+		link_store_dependency(installed_pkg, InstalledPackage{
+			pkg:   peer_pkg
+			peers: select_matching_peers(peer_pkg.peer_dependencies, child_providers)
+		})!
 	}
 }
 
-fn link_store_dependency(parent ResolvedPackage, child ResolvedPackage) ! {
-	mut dest := os.join_path(store_node_modules_dir(parent), child.name)
-	if child.name == parent.name {
-		dest = os.join_path(store_node_modules_dir(parent), 'node_modules', child.name)
+fn select_matching_peers(peer_specs map[string]string, providers map[string]ResolvedPackage) map[string]ResolvedPackage {
+	mut peers := map[string]ResolvedPackage{}
+	for peer_name, peer_spec in peer_specs {
+		if peer_name !in providers {
+			continue
+		}
+		provider := providers[peer_name]
+		if version_matches_spec(provider.version, peer_spec) || peer_spec.trim_space() == '*' {
+			peers[peer_name] = provider
+		}
+	}
+	return peers
+}
+
+fn providers_for_child(parent_providers map[string]ResolvedPackage, installed_pkg InstalledPackage) map[string]ResolvedPackage {
+	mut providers := parent_providers.clone()
+	providers[installed_pkg.pkg.name] = installed_pkg.pkg
+	for peer_name, peer_pkg in installed_pkg.peers {
+		providers[peer_name] = peer_pkg
+	}
+	return providers
+}
+
+fn link_store_dependency(parent InstalledPackage, child InstalledPackage) ! {
+	mut dest := os.join_path(store_node_modules_dir(parent), child.pkg.name)
+	if child.pkg.name == parent.pkg.name {
+		dest = os.join_path(store_node_modules_dir(parent), 'node_modules', child.pkg.name)
 	}
 	target := relative_path(os.dir(dest), store_package_target(child))
 	ensure_package_link(target, store_package_target(child), dest)!
 }
 
-fn link_hidden_store_dependency(pkg ResolvedPackage) ! {
-	dest := os.join_path(hidden_store_node_modules_dir(), pkg.name)
-	target := relative_path(os.dir(dest), store_package_target(pkg))
-	ensure_package_link(target, store_package_target(pkg), dest)!
+fn link_hidden_store_dependency(installed_pkg InstalledPackage) ! {
+	dest := os.join_path(hidden_store_node_modules_dir(), installed_pkg.pkg.name)
+	target := relative_path(os.dir(dest), store_package_target(installed_pkg))
+	ensure_package_link(target, store_package_target(installed_pkg), dest)!
 }
 
-fn link_root_dependency(pkg ResolvedPackage) ! {
-	dest := os.join_path('node_modules', pkg.name)
-	target := relative_path(os.dir(dest), store_package_target(pkg))
-	ensure_package_link(target, store_package_target(pkg), dest)!
+fn link_root_dependency(installed_pkg InstalledPackage) ! {
+	dest := os.join_path('node_modules', installed_pkg.pkg.name)
+	target := relative_path(os.dir(dest), store_package_target(installed_pkg))
+	ensure_package_link(target, store_package_target(installed_pkg), dest)!
+}
+
+fn link_root_bins(installed_pkg InstalledPackage) ! {
+	for bin_name, bin_target in installed_pkg.pkg.bin {
+		dest := os.join_path('node_modules', '.bin', bin_name)
+		target_path := os.join_path('node_modules', installed_pkg.pkg.name, bin_target)
+		target := relative_path(os.dir(dest), target_path)
+		ensure_file_link(target, os.join_path(store_package_target(installed_pkg), bin_target),
+			dest)!
+	}
+}
+
+fn link_bins_for_package(installed_pkg InstalledPackage, providers map[string]ResolvedPackage) ! {
+	bin_dir := os.join_path(store_node_modules_dir(installed_pkg), '.bin')
+	if !os.exists(bin_dir) {
+		os.mkdir_all(bin_dir)!
+	}
+
+	mut visible := map[string]InstalledPackage{}
+	visible[installed_pkg.pkg.name] = installed_pkg
+	child_providers := providers_for_child(providers, installed_pkg)
+	for dep_name, dep_spec in installed_pkg.pkg.dependencies {
+		if dep_name !in providers {
+			continue
+		}
+		dep_pkg := providers[dep_name]
+		if !version_matches_spec(dep_pkg.version, dep_spec) {
+			continue
+		}
+		visible[dep_name] = InstalledPackage{
+			pkg:   dep_pkg
+			peers: select_matching_peers(dep_pkg.peer_dependencies, child_providers)
+		}
+	}
+	for peer_name, peer_pkg in installed_pkg.peers {
+		visible[peer_name] = InstalledPackage{
+			pkg:   peer_pkg
+			peers: select_matching_peers(peer_pkg.peer_dependencies, child_providers)
+		}
+	}
+
+	for _, target_pkg in visible {
+		for bin_name, bin_target in target_pkg.pkg.bin {
+			dest := os.join_path(bin_dir, bin_name)
+			target_path := os.join_path(store_package_target(target_pkg), bin_target)
+			target := relative_path(os.dir(dest), target_path)
+			ensure_file_link(target, target_path, dest)!
+		}
+	}
 }
 
 fn ensure_package_link(target string, fallback_target string, dest string) ! {
@@ -346,6 +532,17 @@ fn ensure_package_link(target string, fallback_target string, dest string) ! {
 		return
 	}
 	link_path_recursive(fallback_target, dest)!
+}
+
+fn ensure_file_link(target string, fallback_target string, dest string) ! {
+	if os.exists(dest) || os.is_link(dest) {
+		os.rm(dest) or { os.rmdir_all(dest) or {} }
+	}
+	os.mkdir_all(os.dir(dest))!
+	if try_symlink_or_junction(target, fallback_target, dest) {
+		return
+	}
+	os.link(fallback_target, dest) or { os.cp(fallback_target, dest)! }
 }
 
 fn try_symlink_or_junction(target string, fallback_target string, dest string) bool {
@@ -479,28 +676,53 @@ fn bun_cache_folder_name(pkg ResolvedPackage) string {
 	return '${pkg.name}@${pkg.version}@@@1'
 }
 
-fn store_key_for(pkg ResolvedPackage) string {
-	return '${pkg.name}@${pkg.version}'
+fn store_key_for(installed_pkg InstalledPackage) string {
+	return store_folder_name(installed_pkg)
 }
 
-fn store_folder_name(pkg ResolvedPackage) string {
-	return store_key_for(pkg)
+fn store_folder_name(installed_pkg InstalledPackage) string {
+	peer_suffix := peer_hash_suffix(installed_pkg.peers)
+	base_name := installed_pkg.pkg.name.replace('/', '+').replace('@', '@')
+	return '${base_name}@${installed_pkg.pkg.version}${peer_suffix}'
+}
+
+fn peer_hash_suffix(peers map[string]ResolvedPackage) string {
+	if peers.len == 0 {
+		return ''
+	}
+	mut keys := peers.keys()
+	keys.sort()
+	mut parts := []string{}
+	for key in keys {
+		peer_pkg := peers[key]
+		parts << '${peer_pkg.name}@${peer_pkg.version}'
+	}
+	hash := fnv1a64(parts.join('|'))
+	return '+${hash}'
+}
+
+fn fnv1a64(input string) string {
+	mut hash := u64(14695981039346656037)
+	for ch in input.bytes() {
+		hash = (hash ^ u64(ch)) * u64(1099511628211)
+	}
+	return '${hash:016x}'
 }
 
 fn hidden_store_node_modules_dir() string {
 	return os.join_path('node_modules', bun_store_dir, 'node_modules')
 }
 
-fn store_package_root(pkg ResolvedPackage) string {
-	return os.join_path('node_modules', bun_store_dir, store_folder_name(pkg))
+fn store_package_root(installed_pkg InstalledPackage) string {
+	return os.join_path('node_modules', bun_store_dir, store_folder_name(installed_pkg))
 }
 
-fn store_node_modules_dir(pkg ResolvedPackage) string {
-	return os.join_path(store_package_root(pkg), 'node_modules')
+fn store_node_modules_dir(installed_pkg InstalledPackage) string {
+	return os.join_path(store_package_root(installed_pkg), 'node_modules')
 }
 
-fn store_package_target(pkg ResolvedPackage) string {
-	return os.join_path(store_node_modules_dir(pkg), pkg.name)
+fn store_package_target(installed_pkg InstalledPackage) string {
+	return os.join_path(store_node_modules_dir(installed_pkg), installed_pkg.pkg.name)
 }
 
 fn resolved_by_exact_key(ctx InstallContext, name string, spec string) !ResolvedPackage {
