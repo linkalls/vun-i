@@ -33,6 +33,7 @@ jobs:
           "ImageVersion=$env:ImageVersion" | Tee-Object -FilePath env-info.txt -Append
           "bun_version=$(bun --version)" | Tee-Object -FilePath env-info.txt -Append
           "v_version=$(v version)" | Tee-Object -FilePath env-info.txt -Append
+          "bun_cache=$env:USERPROFILE\.bun\install\cache" | Tee-Object -FilePath env-info.txt -Append
 
       - name: Generate dummy package.json
         shell: powershell
@@ -51,23 +52,54 @@ jobs:
       - name: Compile vun-i
         run: v -prod -o vun.exe .
 
-      - name: Benchmark cold installs
+      - name: Benchmark true-cold installs (3 runs)
+        shell: powershell
+        run: |
+          $results = @()
+          $bunCache = Join-Path $env:USERPROFILE '.bun\install\cache'
+
+          for ($i = 1; $i -le 3; $i++) {
+            if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
+            if (Test-Path bun.lock) { Remove-Item -Force bun.lock }
+            if (Test-Path $bunCache) { Remove-Item -Recurse -Force $bunCache }
+            $time = Measure-Command { bun install --linker isolated }
+            $results += [pscustomobject]@{ tool = 'bun'; mode = 'true-cold'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
+          }
+
+          for ($i = 1; $i -le 3; $i++) {
+            if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
+            if (Test-Path bun.lock) { Remove-Item -Force bun.lock }
+            if (Test-Path $bunCache) { Remove-Item -Recurse -Force $bunCache }
+            $time = Measure-Command { .\vun.exe }
+            $results += [pscustomobject]@{ tool = 'vun-i'; mode = 'true-cold'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
+          }
+
+          $results | ConvertTo-Json | Set-Content true-cold-benchmark.json
+          $results | ForEach-Object { "{0} {1} run#{2}: {3} ms" -f $_.tool, $_.mode, $_.run, $_.milliseconds } | Tee-Object -FilePath true-cold-benchmark.txt
+
+      - name: Benchmark project-cold installs (3 runs)
         shell: powershell
         run: |
           $results = @()
 
-          if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
-          if (Test-Path bun.lock) { Remove-Item -Force bun.lock }
-          $bunCold = Measure-Command { bun install --linker isolated }
-          $results += [pscustomobject]@{ tool = 'bun'; mode = 'cold'; milliseconds = [math]::Round($bunCold.TotalMilliseconds, 4) }
+          bun install --linker isolated | Out-Null
+          for ($i = 1; $i -le 3; $i++) {
+            if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
+            if (Test-Path bun.lock) { Remove-Item -Force bun.lock }
+            $time = Measure-Command { bun install --linker isolated }
+            $results += [pscustomobject]@{ tool = 'bun'; mode = 'project-cold'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
+          }
 
-          if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
-          if (Test-Path bun.lock) { Remove-Item -Force bun.lock }
-          $vunCold = Measure-Command { .\vun.exe }
-          $results += [pscustomobject]@{ tool = 'vun-i'; mode = 'cold'; milliseconds = [math]::Round($vunCold.TotalMilliseconds, 4) }
+          .\vun.exe | Out-Null
+          for ($i = 1; $i -le 3; $i++) {
+            if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
+            if (Test-Path bun.lock) { Remove-Item -Force bun.lock }
+            $time = Measure-Command { .\vun.exe }
+            $results += [pscustomobject]@{ tool = 'vun-i'; mode = 'project-cold'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
+          }
 
-          $results | ConvertTo-Json | Set-Content cold-benchmark.json
-          $results | ForEach-Object { "{0} {1}: {2} ms" -f $_.tool, $_.mode, $_.milliseconds } | Tee-Object -FilePath cold-benchmark.txt
+          $results | ConvertTo-Json | Set-Content project-cold-benchmark.json
+          $results | ForEach-Object { "{0} {1} run#{2}: {3} ms" -f $_.tool, $_.mode, $_.run, $_.milliseconds } | Tee-Object -FilePath project-cold-benchmark.txt
 
       - name: Benchmark warm installs (3 runs)
         shell: powershell
@@ -92,20 +124,32 @@ jobs:
           $results | ConvertTo-Json | Set-Content warm-benchmark.json
           $results | ForEach-Object { "{0} {1} run#{2}: {3} ms" -f $_.tool, $_.mode, $_.run, $_.milliseconds } | Tee-Object -FilePath warm-benchmark.txt
 
-          $summary = $results | Group-Object tool | ForEach-Object {
+      - name: Summarize benchmark results
+        shell: powershell
+        run: |
+          $all = @()
+          $all += Get-Content true-cold-benchmark.json | ConvertFrom-Json
+          $all += Get-Content project-cold-benchmark.json | ConvertFrom-Json
+          $all += Get-Content warm-benchmark.json | ConvertFrom-Json
+
+          $summary = $all | Group-Object tool, mode | ForEach-Object {
+            $tool = $_.Group[0].tool
+            $mode = $_.Group[0].mode
             $vals = $_.Group.milliseconds
             $avg = ($vals | Measure-Object -Average).Average
             $min = ($vals | Measure-Object -Minimum).Minimum
             $max = ($vals | Measure-Object -Maximum).Maximum
             [pscustomobject]@{
-              tool = $_.Name
+              tool = $tool
+              mode = $mode
               avg_ms = [math]::Round($avg, 4)
               min_ms = [math]::Round($min, 4)
               max_ms = [math]::Round($max, 4)
             }
           }
+
           $summary | ConvertTo-Json | Set-Content benchmark-summary.json
-          $summary | ForEach-Object { "{0} avg={1} ms min={2} ms max={3} ms" -f $_.tool, $_.avg_ms, $_.min_ms, $_.max_ms } | Tee-Object -FilePath benchmark-summary.txt
+          $summary | ForEach-Object { "{0} {1} avg={2} ms min={3} ms max={4} ms" -f $_.tool, $_.mode, $_.avg_ms, $_.min_ms, $_.max_ms } | Tee-Object -FilePath benchmark-summary.txt
 
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v7
@@ -113,8 +157,10 @@ jobs:
           name: benchmark-results
           path: |
             env-info.txt
-            cold-benchmark.txt
-            cold-benchmark.json
+            true-cold-benchmark.txt
+            true-cold-benchmark.json
+            project-cold-benchmark.txt
+            project-cold-benchmark.json
             warm-benchmark.txt
             warm-benchmark.json
             benchmark-summary.txt
