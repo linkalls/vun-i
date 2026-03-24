@@ -84,7 +84,15 @@ jobs:
             if (Test-Path bun.lock) { Remove-Item -Force bun.lock }
             if (Test-Path $bunCache) { Remove-Item -Recurse -Force $bunCache }
             $time = Measure-Command { .\vun.exe }
-            $results += [pscustomobject]@{ tool = 'vun-i'; mode = 'true-cold'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
+            $results += [pscustomobject]@{ tool = 'vun-i (speed)'; mode = 'true-cold'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
+          }
+
+          for ($i = 1; $i -le 3; $i++) {
+            if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
+            if (Test-Path bun.lock) { Remove-Item -Force bun.lock }
+            if (Test-Path $bunCache) { Remove-Item -Recurse -Force $bunCache }
+            $time = Measure-Command { .\vun.exe --sync-bun-lock }
+            $results += [pscustomobject]@{ tool = 'vun-i (compat)'; mode = 'true-cold'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
           }
 
           for ($i = 1; $i -le 3; $i++) {
@@ -121,7 +129,15 @@ jobs:
             if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
             if (Test-Path bun.lock) { Remove-Item -Force bun.lock }
             $time = Measure-Command { .\vun.exe }
-            $results += [pscustomobject]@{ tool = 'vun-i'; mode = 'warm'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
+            $results += [pscustomobject]@{ tool = 'vun-i (speed)'; mode = 'warm'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
+          }
+
+          .\vun.exe --sync-bun-lock | Out-Null
+          for ($i = 1; $i -le 3; $i++) {
+            if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
+            if (Test-Path bun.lock) { Remove-Item -Force bun.lock }
+            $time = Measure-Command { .\vun.exe --sync-bun-lock }
+            $results += [pscustomobject]@{ tool = 'vun-i (compat)'; mode = 'warm'; run = $i; milliseconds = [math]::Round($time.TotalMilliseconds, 4) }
           }
 
           npm install | Out-Null

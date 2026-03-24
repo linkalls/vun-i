@@ -46,7 +46,6 @@ fn prefetch_package(pkg ResolvedPackage, cache_dir string, mut wg sync.WaitGroup
 
 	cache_pkg_dir := package_cache_dir(cache_dir, pkg)
 	if os.exists(os.join_path(cache_pkg_dir, 'package.json')) {
-		println('♻️ cache hit ${pkg.name}@${pkg.version}')
 		return
 	}
 
@@ -69,5 +68,5 @@ fn prefetch_package(pkg ResolvedPackage, cache_dir string, mut wg sync.WaitGroup
 	}
 
 	os.rm(tar_path) or {}
-	println('⬇️ cached ${pkg.name}@${pkg.version}')
 }
+

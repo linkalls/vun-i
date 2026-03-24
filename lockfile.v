@@ -16,3 +16,19 @@ fn sync_bun_lockfile() {
 		eprintln('⚠️ bun lockfile sync failed: ${result.output}')
 	}
 }
+
+fn sync_npm_lockfile() {
+	npm_path := os.find_abs_path_of_executable('npm') or { '' }
+	if npm_path == '' {
+		println('⚠️ npm not found; skipped package-lock.json generation')
+		return
+	}
+	println('🧾 syncing package-lock.json via npm install --package-lock-only')
+	result := os.execute('npm install --package-lock-only')
+	if result.exit_code == 0 {
+		println('🟢 package-lock.json synced')
+	} else {
+		eprintln('⚠️ npm lockfile sync failed: ${result.output}')
+	}
+}
+
