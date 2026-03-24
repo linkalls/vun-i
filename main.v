@@ -57,6 +57,7 @@ fn main() {
 	mut ctx := InstallContext{
 		resolved:          map[string]ResolvedPackage{}
 		root_dependencies: map[string]ResolvedPackage{}
+		installed:         map[string]bool{}
 	}
 
 	for name, spec in root_manifest.dependencies {
@@ -75,20 +76,16 @@ fn main() {
 	// Start prefetching in the background
 	spawn prefetch_all_streaming(ctx.resolved.values(), cache_dir, ready_chan)
 	
-	mut installed := map[string]bool{}
 	mut ready_count := 0
 	total_to_install := ctx.resolved.len
 	
-	// Track which packages are physically in place
-	mut physical_ready := map[string]bool{}
-	
 	// Installation loop that waits for packages to be ready
 	for ready_count < total_to_install {
-		pkg := <-ready_chan
-		physical_ready[package_key(pkg.name, pkg.version)] = true
+		_ = <-ready_chan
 		ready_count++
 	}
 
+	mut link_threads := []thread !{}
 	for name, spec in root_manifest.dependencies {
 		pkg := resolved_by_exact_key(ctx, name, spec) or {
 			first_resolved_for_name(ctx, name) or {
@@ -102,16 +99,24 @@ fn main() {
 			peers: root_peers
 		}
 		providers := providers_for_child(ctx.root_dependencies, installed_pkg)
-		install_store_package(mut ctx, cache_dir, installed_pkg, providers, mut installed) or {
-			eprintln('❌ failed to install ${name}: ${err.msg()}')
-			return
-		}
-		link_root_dependency(installed_pkg) or {
-			eprintln('❌ failed to link root dependency ${name}: ${err.msg()}')
-			return
-		}
-		link_root_bins(installed_pkg) or {
-			eprintln('❌ failed to link root bins for ${name}: ${err.msg()}')
+		
+		link_threads << spawn fn (ctx &InstallContext, cache_dir string, installed_pkg InstalledPackage, providers map[string]ResolvedPackage) ! {
+			mut mut_ctx := unsafe { &InstallContext(ctx) }
+			install_store_package(mut mut_ctx, cache_dir, installed_pkg, providers) or {
+				return error('failed to install ${installed_pkg.pkg.name}: ${err.msg()}')
+			}
+			link_root_dependency(installed_pkg) or {
+				return error('failed to link root dependency ${installed_pkg.pkg.name}: ${err.msg()}')
+			}
+			link_root_bins(installed_pkg) or {
+				return error('failed to link root bins for ${installed_pkg.pkg.name}: ${err.msg()}')
+			}
+		}(&ctx, cache_dir, installed_pkg, providers)
+	}
+
+	for t in link_threads {
+		t.wait() or {
+			eprintln('❌ link thread failed: ${err.msg()}')
 			return
 		}
 	}

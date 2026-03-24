@@ -73,9 +73,8 @@ fn link_package_dir(src_dir string, dest_dir string) ! {
 	if !os.exists(src_dir) {
 		return error('source package dir not found: ${src_dir}')
 	}
-	if os.exists(dest_dir) {
-		os.rmdir_all(dest_dir)!
-	}
+	// We assume dest_dir doesn't exist or is handled by the caller,
+	// or we use remove_existing_path which is safer for concurrent checks if we had any.
 	os.mkdir_all(dest_dir)!
 
 	for entry in os.ls(src_dir)! {

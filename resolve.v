@@ -2,11 +2,15 @@ module main
 
 import os
 
-fn install_store_package(mut ctx InstallContext, cache_dir string, installed_pkg InstalledPackage, providers map[string]ResolvedPackage, mut installed map[string]bool) ! {
+fn install_store_package(mut ctx InstallContext, cache_dir string, installed_pkg InstalledPackage, providers map[string]ResolvedPackage) ! {
 	store_key := store_key_for(installed_pkg)
-	if store_key in installed {
+	ctx.mu.@lock()
+	if store_key in ctx.installed {
+		ctx.mu.unlock()
 		return
 	}
+	ctx.installed[store_key] = true
+	ctx.mu.unlock()
 
 	package_root := store_package_root(installed_pkg)
 	target_dir := store_package_target(installed_pkg)
@@ -19,7 +23,6 @@ fn install_store_package(mut ctx InstallContext, cache_dir string, installed_pkg
 
 	link_hidden_store_dependency(installed_pkg)!
 	link_bins_for_package(installed_pkg, providers)!
-	installed[store_key] = true
 
 	child_providers := providers_for_child(providers, installed_pkg)
 	for dep_name, dep_spec in installed_pkg.pkg.dependencies {
@@ -28,7 +31,7 @@ fn install_store_package(mut ctx InstallContext, cache_dir string, installed_pkg
 		}
 		dep_peers := select_matching_peers(dep.peer_dependencies, child_providers)
 		child := InstalledPackage{dep, dep_peers}
-		install_store_package(mut ctx, cache_dir, child, child_providers, mut installed)!
+		install_store_package(mut ctx, cache_dir, child, child_providers)!
 		link_store_dependency(installed_pkg, child)!
 	}
 

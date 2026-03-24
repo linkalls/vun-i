@@ -1,5 +1,7 @@
 module main
 
+import sync
+
 const registry_url = 'https://registry.npmjs.org'
 const bun_store_dir = '.bun'
 
@@ -38,6 +40,8 @@ struct InstallContext {
 mut:
 	root_dependencies map[string]ResolvedPackage
 	resolved          map[string]ResolvedPackage
+	installed         map[string]bool
+	mu                &sync.Mutex = sync.new_mutex()
 }
 
 struct InstalledPackage {
