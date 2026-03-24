@@ -7,7 +7,7 @@ import sync
 import time
 
 const registry_url = 'https://registry.npmjs.org'
-const bun_cache_suffix = '.bun/install/cache'
+const bun_store_dir = '.bun'
 
 struct PackageJson {
 	dependencies map[string]string
@@ -56,6 +56,11 @@ fn main() {
 		return
 	}
 
+	prepare_node_modules() or {
+		eprintln('❌ failed to prepare node_modules: ${err.msg()}')
+		return
+	}
+
 	mut ctx := InstallContext{
 		resolved: map[string]ResolvedPackage{}
 	}
@@ -70,14 +75,20 @@ fn main() {
 	println('📦 resolved ${ctx.resolved.len} packages')
 	prefetch_all(ctx.resolved.values(), cache_dir)
 
-	os.mkdir_all('node_modules') or {
-		eprintln('❌ failed to create node_modules: ${err.msg()}')
-		return
-	}
-
-	for name, _ in root_manifest.dependencies {
-		install_package_tree(ctx, cache_dir, name, 'node_modules') or {
+	mut installed := map[string]bool{}
+	for name, spec in root_manifest.dependencies {
+		pkg := resolved_by_exact_key(ctx, name, spec) or {
+			first_resolved_for_name(ctx, name) or {
+				eprintln('❌ missing resolved package for ${name}@${spec}')
+				return
+			}
+		}
+		install_store_package(mut ctx, cache_dir, pkg, mut installed) or {
 			eprintln('❌ failed to install ${name}: ${err.msg()}')
+			return
+		}
+		link_root_dependency(pkg) or {
+			eprintln('❌ failed to link root dependency ${name}: ${err.msg()}')
 			return
 		}
 	}
@@ -86,6 +97,11 @@ fn main() {
 
 	elapsed_ms := time.since(start).milliseconds()
 	println('✅ vun-i finished in ${elapsed_ms}ms')
+}
+
+fn prepare_node_modules() ! {
+	os.mkdir_all('node_modules')!
+	os.mkdir_all(os.join_path('node_modules', bun_store_dir))!
 }
 
 fn read_package_json(path string) !PackageJson {
@@ -272,30 +288,58 @@ fn prefetch_package(pkg ResolvedPackage, cache_dir string, mut wg sync.WaitGroup
 	println('⬇️ cached ${pkg.name}@${pkg.version}')
 }
 
-fn install_package_tree(ctx InstallContext, cache_dir string, name string, target_node_modules string) ! {
-	root_pkg := first_resolved_for_name(ctx, name)!
-	mut seen := map[string]bool{}
-	install_package_recursive(ctx, cache_dir, root_pkg, target_node_modules, mut seen)!
-}
-
-fn install_package_recursive(ctx InstallContext, cache_dir string, pkg ResolvedPackage, target_node_modules string, mut seen map[string]bool) ! {
-	seen_key := '${target_node_modules}::${pkg.name}@${pkg.version}'
-	if seen_key in seen {
+fn install_store_package(mut ctx InstallContext, cache_dir string, pkg ResolvedPackage, mut installed map[string]bool) ! {
+	store_key := store_key_for(pkg)
+	if store_key in installed {
 		return
 	}
-	seen[seen_key] = true
 
-	src_dir := package_cache_dir(cache_dir, pkg)
-	dest_dir := os.join_path(target_node_modules, pkg.name)
-	link_package_dir(src_dir, dest_dir)!
+	package_root := store_package_root(pkg)
+	target_dir := store_package_target(pkg)
+	source_dir := package_cache_dir(cache_dir, pkg)
 
-	child_node_modules := os.join_path(dest_dir, 'node_modules')
+	if !os.exists(target_dir) {
+		os.mkdir_all(os.join_path(package_root, 'node_modules'))!
+		link_package_dir(source_dir, target_dir)!
+	}
+
+	installed[store_key] = true
+
 	for dep_name, dep_spec in pkg.dependencies {
 		dep := resolved_by_exact_key(ctx, dep_name, dep_spec) or {
 			first_resolved_for_name(ctx, dep_name)!
 		}
-		install_package_recursive(ctx, cache_dir, dep, child_node_modules, mut seen)!
+		install_store_package(mut ctx, cache_dir, dep, mut installed)!
+		link_store_dependency(pkg, dep)!
 	}
+}
+
+fn link_store_dependency(parent ResolvedPackage, child ResolvedPackage) ! {
+	parent_node_modules := os.join_path(store_package_root(parent), 'node_modules')
+	dest := os.join_path(parent_node_modules, child.name)
+	target := relative_path(os.dir(dest), store_package_target(child))
+	ensure_symlink(target, dest)!
+}
+
+fn link_root_dependency(pkg ResolvedPackage) ! {
+	dest := os.join_path('node_modules', pkg.name)
+	target := relative_path(os.dir(dest), store_package_target(pkg))
+	ensure_symlink(target, dest)!
+}
+
+fn ensure_symlink(target string, dest string) ! {
+	if os.exists(dest) || os.is_link(dest) {
+		os.rm(dest) or { os.rmdir_all(dest) or {} }
+	}
+	os.mkdir_all(os.dir(dest))!
+	os.symlink(target, dest) or {
+		link_path_recursive(store_package_target_from_dest(dest, target), dest)!
+	}
+}
+
+fn store_package_target_from_dest(dest string, target string) string {
+	base := os.real_path(os.dir(dest))
+	return os.join_path(base, target)
 }
 
 fn link_package_dir(src_dir string, dest_dir string) ! {
@@ -307,11 +351,11 @@ fn link_package_dir(src_dir string, dest_dir string) ! {
 	}
 	os.mkdir_all(dest_dir)!
 
-	entries := os.ls(src_dir)!
-	for entry in entries {
-		src_path := os.join_path(src_dir, entry)
-		dest_path := os.join_path(dest_dir, entry)
-		link_path_recursive(src_path, dest_path)!
+	for entry in os.ls(src_dir)! {
+		if entry == 'node_modules' {
+			continue
+		}
+		link_path_recursive(os.join_path(src_dir, entry), os.join_path(dest_dir, entry))!
 	}
 }
 
@@ -326,6 +370,44 @@ fn link_path_recursive(src string, dest string) ! {
 
 	os.mkdir_all(os.dir(dest))!
 	os.link(src, dest) or { os.cp(src, dest)! }
+}
+
+fn relative_path(from string, to string) string {
+	from_norm := normalize_sep(from)
+	to_norm := normalize_sep(to)
+	from_parts := split_non_empty(from_norm)
+	to_parts := split_non_empty(to_norm)
+
+	mut i := 0
+	for i < from_parts.len && i < to_parts.len && from_parts[i] == to_parts[i] {
+		i++
+	}
+
+	mut out := []string{}
+	for _ in i .. from_parts.len {
+		out << '..'
+	}
+	for j in i .. to_parts.len {
+		out << to_parts[j]
+	}
+	if out.len == 0 {
+		return '.'
+	}
+	return out.join(os.path_separator.str())
+}
+
+fn normalize_sep(path string) string {
+	return path.replace('\\', '/').trim_right('/')
+}
+
+fn split_non_empty(path string) []string {
+	mut out := []string{}
+	for part in path.split('/') {
+		if part != '' && part != '.' {
+			out << part
+		}
+	}
+	return out
 }
 
 fn sync_bun_lockfile() {
@@ -352,7 +434,7 @@ fn bun_cache_dir() string {
 	if custom_cache != '' {
 		return custom_cache
 	}
-	return os.join_path(os.home_dir(), bun_cache_suffix)
+	return os.join_path(os.home_dir(), '.bun', 'install', 'cache')
 }
 
 fn package_cache_dir(cache_dir string, pkg ResolvedPackage) string {
@@ -367,6 +449,22 @@ fn bun_cache_folder_name(pkg ResolvedPackage) string {
 		}
 	}
 	return '${pkg.name}@${pkg.version}@@@1'
+}
+
+fn store_key_for(pkg ResolvedPackage) string {
+	return '${pkg.name}@${pkg.version}'
+}
+
+fn store_folder_name(pkg ResolvedPackage) string {
+	return store_key_for(pkg)
+}
+
+fn store_package_root(pkg ResolvedPackage) string {
+	return os.join_path('node_modules', bun_store_dir, store_folder_name(pkg))
+}
+
+fn store_package_target(pkg ResolvedPackage) string {
+	return os.join_path(store_package_root(pkg), 'node_modules', pkg.name)
 }
 
 fn resolved_by_exact_key(ctx InstallContext, name string, spec string) !ResolvedPackage {
