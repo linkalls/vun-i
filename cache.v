@@ -5,10 +5,18 @@ import net.http
 import os
 import sync
 
+struct WriteOp {
+	path    string
+	data    []u8
+	is_last bool
+}
+
 struct PackageReader {
 mut:
 	target_dir   string
-	current_file &os.File = unsafe { nil }
+	current_path string
+	write_chan   chan WriteOp
+	buffer       []u8
 }
 
 fn (mut r PackageReader) dir_block(mut read tar.Read, size u64) {
@@ -28,43 +36,75 @@ fn (mut r PackageReader) file_block(mut read tar.Read, size u64) {
 	path := read.get_path()
 	parts := path.split('/')
 	if parts.len <= 1 {
-		r.current_file = unsafe { nil }
+		r.current_path = ''
 		return
 	}
 
-	target_path := os.join_path(r.target_dir, parts[1..].join('/'))
-	parent := os.dir(target_path)
-	if !os.exists(parent) {
-		os.mkdir_all(parent) or {}
-	}
-
-	f := os.create(target_path) or {
-		r.current_file = unsafe { nil }
-		return
-	}
-	r.current_file = &f
+	r.current_path = os.join_path(r.target_dir, parts[1..].join('/'))
+	r.buffer.clear()
 }
 
 fn (mut r PackageReader) data_block(mut read tar.Read, data []u8, pending int) {
-	if r.current_file != unsafe { nil } {
-		r.current_file.write(data) or {}
-		if pending == 0 {
-			r.current_file.close()
-			r.current_file = unsafe { nil }
+	if r.current_path != '' {
+		r.buffer << data
+		// Buffer size: 64KB
+		if r.buffer.len >= 64 * 1024 || pending == 0 {
+			r.write_chan <- WriteOp{
+				path: r.current_path
+				data: r.buffer.clone()
+				is_last: pending == 0
+			}
+			r.buffer.clear()
 		}
 	}
 }
 
 fn (mut r PackageReader) other_block(mut read tar.Read, details string) {}
 
+fn io_worker(write_chan chan WriteOp) {
+	mut files := map[string]os.File{}
+	for {
+		op := <-write_chan or { break }
+		if op.path !in files {
+			parent := os.dir(op.path)
+			if !os.exists(parent) {
+				os.mkdir_all(parent) or { continue }
+			}
+			f := os.create(op.path) or { continue }
+			files[op.path] = f
+		}
+		mut f := files[op.path] or { continue }
+		f.write(op.data) or {}
+		if op.is_last {
+			f.close()
+			files.delete(op.path)
+		}
+	}
+	for _, mut f in files {
+		f.close()
+	}
+}
+
 fn extract_tgz_native(tgz_data []u8, dest string) ! {
-	mut reader := &PackageReader{
+	write_chan := chan WriteOp{cap: 100}
+	mut wg := sync.new_waitgroup()
+	wg.add(1)
+	spawn fn (write_chan chan WriteOp, mut wg sync.WaitGroup) {
+		io_worker(write_chan)
+		wg.done()
+	}(write_chan, mut wg)
+
+	mut reader := PackageReader{
 		target_dir: dest
+		write_chan: write_chan
+		buffer: []u8{cap: 64 * 1024}
 	}
 	mut untar := tar.new_untar(reader)
 	mut decompressor := tar.new_decompressor(untar)
 
 	decompressor.read_chunks(tgz_data)!
+	write_chan.close()
+	wg.wait()
 }
 
 fn bun_cache_dir() string {
@@ -103,6 +143,10 @@ fn prefetch_all_streaming(packages []ResolvedPackage, cache_dir string, ready_ch
 }
 
 fn prefetch_package_streaming(pkg ResolvedPackage, cache_dir string, ready_chan chan ResolvedPackage, mut wg sync.WaitGroup) {
+	spawn prefetch_package_streaming_worker(pkg, cache_dir, ready_chan, mut wg)
+}
+
+fn prefetch_package_streaming_worker(pkg ResolvedPackage, cache_dir string, ready_chan chan ResolvedPackage, mut wg sync.WaitGroup) {
 	defer {
 		wg.done()
 		ready_chan <- pkg
