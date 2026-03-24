@@ -51,7 +51,7 @@ jobs:
           }
 
       - name: Compile vun-i
-        run: v -prod -o vun.exe vun.v
+        run: v -prod -o vun.exe .
 
       - name: Benchmark vun-i
         shell: powershell
