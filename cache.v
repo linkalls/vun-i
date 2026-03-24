@@ -1,8 +1,71 @@
 module main
 
+import archive.tar
 import net.http
 import os
 import sync
+
+struct PackageReader {
+mut:
+	target_dir   string
+	current_file &os.File = unsafe { nil }
+}
+
+fn (mut r PackageReader) dir_block(mut read tar.Read, size u64) {
+	path := read.get_path()
+	parts := path.split('/')
+	if parts.len <= 1 {
+		return
+	}
+
+	target_path := os.join_path(r.target_dir, parts[1..].join('/'))
+	if target_path != '' {
+		os.mkdir_all(target_path) or {}
+	}
+}
+
+fn (mut r PackageReader) file_block(mut read tar.Read, size u64) {
+	path := read.get_path()
+	parts := path.split('/')
+	if parts.len <= 1 {
+		r.current_file = unsafe { nil }
+		return
+	}
+
+	target_path := os.join_path(r.target_dir, parts[1..].join('/'))
+	parent := os.dir(target_path)
+	if !os.exists(parent) {
+		os.mkdir_all(parent) or {}
+	}
+
+	f := os.create(target_path) or {
+		r.current_file = unsafe { nil }
+		return
+	}
+	r.current_file = &f
+}
+
+fn (mut r PackageReader) data_block(mut read tar.Read, data []u8, pending int) {
+	if r.current_file != unsafe { nil } {
+		r.current_file.write(data) or {}
+		if pending == 0 {
+			r.current_file.close()
+			r.current_file = unsafe { nil }
+		}
+	}
+}
+
+fn (mut r PackageReader) other_block(mut read tar.Read, details string) {}
+
+fn extract_tgz_native(tgz_data []u8, dest string) ! {
+	mut reader := &PackageReader{
+		target_dir: dest
+	}
+	mut untar := tar.new_untar(reader)
+	mut decompressor := tar.new_decompressor(untar)
+
+	decompressor.read_chunks(tgz_data)!
+}
 
 fn bun_cache_dir() string {
 	custom_cache := os.getenv('BUN_INSTALL_CACHE_DIR')
@@ -55,21 +118,22 @@ fn prefetch_package_streaming(pkg ResolvedPackage, cache_dir string, ready_chan 
 		return
 	}
 
-	tar_path := os.join_path(cache_pkg_dir, 'package.tgz')
-	http.download_file(pkg.tarball, tar_path) or {
+	// We still download to memory for now as http.download_file doesn't expose a stream easily in high-level V
+	// But we use native extraction to avoid 'tar' process overhead
+	resp := http.get(pkg.tarball) or {
 		eprintln('failed to download ${pkg.name}@${pkg.version}: ${err.msg()}')
 		return
 	}
 
-	// Use native V tar extraction if possible for Windows, but stick to command for now
-	cmd := 'tar -xzf "${tar_path}" --strip-components=1 -C "${cache_pkg_dir}"'
-	result := os.execute(cmd)
-	if result.exit_code != 0 {
-		eprintln('failed to extract ${pkg.name}@${pkg.version}: ${result.output}')
+	if resp.status_code != 200 {
+		eprintln('failed to download ${pkg.name}@${pkg.version}: status ${resp.status_code}')
 		return
 	}
 
-	os.rm(tar_path) or {}
+	extract_tgz_native(resp.body.bytes(), cache_pkg_dir) or {
+		eprintln('failed to extract ${pkg.name}@${pkg.version} (native): ${err.msg()}')
+		return
+	}
 }
 
 fn prefetch_all(packages []ResolvedPackage, cache_dir string) {
@@ -100,19 +164,19 @@ fn prefetch_package(pkg ResolvedPackage, cache_dir string, mut wg sync.WaitGroup
 		return
 	}
 
-	tar_path := os.join_path(cache_pkg_dir, 'package.tgz')
-	http.download_file(pkg.tarball, tar_path) or {
+	resp := http.get(pkg.tarball) or {
 		eprintln('failed to download ${pkg.name}@${pkg.version}: ${err.msg()}')
 		return
 	}
 
-	cmd := 'tar -xzf "${tar_path}" --strip-components=1 -C "${cache_pkg_dir}"'
-	result := os.execute(cmd)
-	if result.exit_code != 0 {
-		eprintln('failed to extract ${pkg.name}@${pkg.version}: ${result.output}')
+	if resp.status_code != 200 {
+		eprintln('failed to download ${pkg.name}@${pkg.version}: status ${resp.status_code}')
 		return
 	}
 
-	os.rm(tar_path) or {}
+	extract_tgz_native(resp.body.bytes(), cache_pkg_dir) or {
+		eprintln('failed to extract ${pkg.name}@${pkg.version} (native): ${err.msg()}')
+		return
+	}
 }
 
