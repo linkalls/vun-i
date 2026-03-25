@@ -3,7 +3,6 @@ module main
 import sync
 
 const registry_url = 'https://registry.npmjs.org'
-const bun_store_dir = '.bun'
 
 struct PackageJson {
 	dependencies map[string]string
