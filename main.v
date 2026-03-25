@@ -69,22 +69,11 @@ fn main() {
 	}
 
 	println('📦 resolved ${ctx.resolved.len} packages')
-	
-	// Create a channel to signal when a package is ready (downloaded and extracted)
-	ready_chan := chan ResolvedPackage{cap: 100}
-	
-	// Start prefetching in the background
-	spawn prefetch_all_streaming(ctx.resolved.values(), cache_dir, ready_chan)
-	
-	mut ready_count := 0
-	total_to_install := ctx.resolved.len
-	
-	// Installation loop that waits for packages to be ready
-	for ready_count < total_to_install {
-		_ = <-ready_chan
-		ready_count++
-	}
 
+	// Phase 1: parallel download + extract
+	prefetch_all(ctx.resolved.values(), cache_dir)
+
+	// Phase 2: parallel direct hardlink
 	mut link_threads := []thread !{}
 	for name, spec in root_manifest.dependencies {
 		pkg := resolved_by_exact_key(ctx, name, spec) or {
@@ -99,17 +88,11 @@ fn main() {
 			peers: root_peers
 		}
 		providers := providers_for_child(ctx.root_dependencies, installed_pkg)
-		
+
 		link_threads << spawn fn (ctx &InstallContext, cache_dir string, installed_pkg InstalledPackage, providers map[string]ResolvedPackage) ! {
 			mut mut_ctx := unsafe { &InstallContext(ctx) }
-			install_store_package(mut mut_ctx, cache_dir, installed_pkg, providers) or {
+			install_package_direct(mut mut_ctx, cache_dir, installed_pkg, providers) or {
 				return error('failed to install ${installed_pkg.pkg.name}: ${err.msg()}')
-			}
-			link_root_dependency(installed_pkg) or {
-				return error('failed to link root dependency ${installed_pkg.pkg.name}: ${err.msg()}')
-			}
-			link_root_bins(installed_pkg) or {
-				return error('failed to link root bins for ${installed_pkg.pkg.name}: ${err.msg()}')
 			}
 		}(&ctx, cache_dir, installed_pkg, providers)
 	}
@@ -135,7 +118,5 @@ fn main() {
 
 fn prepare_node_modules() ! {
 	os.mkdir_all('node_modules')!
-	os.mkdir_all(os.join_path('node_modules', bun_store_dir))!
-	os.mkdir_all(hidden_store_node_modules_dir())!
 	os.mkdir_all(os.join_path('node_modules', '.bin'))!
 }

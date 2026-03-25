@@ -129,57 +129,6 @@ fn bun_cache_folder_name(pkg ResolvedPackage) string {
 	return '${pkg.name}@${pkg.version}@@@1'
 }
 
-fn prefetch_all_streaming(packages []ResolvedPackage, cache_dir string, ready_chan chan ResolvedPackage) {
-	if packages.len == 0 {
-		return
-	}
-
-	mut wg := sync.new_waitgroup()
-	for pkg in packages {
-		wg.add(1)
-		spawn prefetch_package_streaming(pkg, cache_dir, ready_chan, mut wg)
-	}
-	wg.wait()
-}
-
-fn prefetch_package_streaming(pkg ResolvedPackage, cache_dir string, ready_chan chan ResolvedPackage, mut wg sync.WaitGroup) {
-	spawn prefetch_package_streaming_worker(pkg, cache_dir, ready_chan, mut wg)
-}
-
-fn prefetch_package_streaming_worker(pkg ResolvedPackage, cache_dir string, ready_chan chan ResolvedPackage, mut wg sync.WaitGroup) {
-	defer {
-		wg.done()
-		ready_chan <- pkg
-	}
-
-	cache_pkg_dir := package_cache_dir(cache_dir, pkg)
-	if os.exists(os.join_path(cache_pkg_dir, 'package.json')) {
-		return
-	}
-
-	os.mkdir_all(cache_pkg_dir) or {
-		eprintln('failed to create cache dir for ${pkg.name}@${pkg.version}: ${err.msg()}')
-		return
-	}
-
-	// We still download to memory for now as http.download_file doesn't expose a stream easily in high-level V
-	// But we use native extraction to avoid 'tar' process overhead
-	resp := http.get(pkg.tarball) or {
-		eprintln('failed to download ${pkg.name}@${pkg.version}: ${err.msg()}')
-		return
-	}
-
-	if resp.status_code != 200 {
-		eprintln('failed to download ${pkg.name}@${pkg.version}: status ${resp.status_code}')
-		return
-	}
-
-	extract_tgz_native(resp.body.bytes(), cache_pkg_dir) or {
-		eprintln('failed to extract ${pkg.name}@${pkg.version} (native): ${err.msg()}')
-		return
-	}
-}
-
 fn prefetch_all(packages []ResolvedPackage, cache_dir string) {
 	if packages.len == 0 {
 		return

@@ -2,7 +2,7 @@ module main
 
 import os
 
-fn install_store_package(mut ctx InstallContext, cache_dir string, installed_pkg InstalledPackage, providers map[string]ResolvedPackage) ! {
+fn install_package_direct(mut ctx InstallContext, cache_dir string, installed_pkg InstalledPackage, providers map[string]ResolvedPackage) ! {
 	store_key := store_key_for(installed_pkg)
 	ctx.mu.@lock()
 	if store_key in ctx.installed {
@@ -12,37 +12,24 @@ fn install_store_package(mut ctx InstallContext, cache_dir string, installed_pkg
 	ctx.installed[store_key] = true
 	ctx.mu.unlock()
 
-	package_root := store_package_root(installed_pkg)
-	target_dir := store_package_target(installed_pkg)
 	source_dir := package_cache_dir(cache_dir, installed_pkg.pkg)
+	dest_dir := os.join_path('node_modules', installed_pkg.pkg.name)
 
-	if !os.exists(target_dir) {
-		os.mkdir_all(os.join_path(package_root, 'node_modules'))!
-		link_package_dir(source_dir, target_dir)!
-	}
-
-	link_hidden_store_dependency(installed_pkg)!
-	link_bins_for_package(installed_pkg, providers)!
+	hardlink_dir_parallel(source_dir, dest_dir)!
+	link_root_bins(installed_pkg)!
 
 	child_providers := providers_for_child(providers, installed_pkg)
+	mut threads := []thread !{}
 	for dep_name, dep_spec in installed_pkg.pkg.dependencies {
 		dep := resolved_by_exact_key(ctx, dep_name, dep_spec) or {
 			first_resolved_for_name(ctx, dep_name)!
 		}
 		dep_peers := select_matching_peers(dep.peer_dependencies, child_providers)
 		child := InstalledPackage{dep, dep_peers}
-		install_store_package(mut ctx, cache_dir, child, child_providers)!
-		link_store_dependency(installed_pkg, child)!
+		threads << spawn install_package_direct(mut ctx, cache_dir, child, child_providers)
 	}
-
-	for peer_name, peer_pkg in installed_pkg.peers {
-		if peer_name == installed_pkg.pkg.name {
-			continue
-		}
-		link_store_dependency(installed_pkg, InstalledPackage{
-			pkg:   peer_pkg
-			peers: select_matching_peers(peer_pkg.peer_dependencies, child_providers)
-		})!
+	for t in threads {
+		t.wait()!
 	}
 }
 

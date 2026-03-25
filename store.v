@@ -2,10 +2,6 @@ module main
 
 import os
 
-fn hidden_store_node_modules_dir() string {
-	return os.join_path('node_modules', bun_store_dir, 'node_modules')
-}
-
 fn store_key_for(installed_pkg InstalledPackage) string {
 	return store_folder_name(installed_pkg)
 }
@@ -37,18 +33,6 @@ fn fnv1a64(input string) string {
 		hash = (hash ^ u64(ch)) * u64(1099511628211)
 	}
 	return '${hash:016x}'
-}
-
-fn store_package_root(installed_pkg InstalledPackage) string {
-	return os.join_path('node_modules', bun_store_dir, store_folder_name(installed_pkg))
-}
-
-fn store_node_modules_dir(installed_pkg InstalledPackage) string {
-	return os.join_path(store_package_root(installed_pkg), 'node_modules')
-}
-
-fn store_package_target(installed_pkg InstalledPackage) string {
-	return os.join_path(store_node_modules_dir(installed_pkg), installed_pkg.pkg.name)
 }
 
 fn relative_path(from string, to string) string {
