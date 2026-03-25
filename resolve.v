@@ -15,7 +15,9 @@ fn install_package_direct(mut ctx InstallContext, cache_dir string, installed_pk
 	source_dir := package_cache_dir(cache_dir, installed_pkg.pkg)
 	dest_dir := os.join_path('node_modules', installed_pkg.pkg.name)
 
-	hardlink_dir_parallel(source_dir, dest_dir)!
+	if !os.exists(dest_dir) {
+		hardlink_dir_parallel(source_dir, dest_dir)!
+	}
 	link_root_bins(installed_pkg)!
 
 	child_providers := providers_for_child(providers, installed_pkg)
