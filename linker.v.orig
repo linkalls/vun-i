@@ -1,22 +1,6 @@
 module main
 
 import os
-import sync
-
-const max_link_threads = 64
-
-@[unsafe]
-fn get_link_semaphore() &sync.Semaphore {
-	mut static sema := &sync.Semaphore(unsafe { nil })
-
-	if unsafe { sema == nil } {
-		sema = sync.new_semaphore()
-		for _ in 0 .. max_link_threads {
-			sema.post()
-		}
-	}
-	return sema
-}
 
 fn link_store_dependency(parent InstalledPackage, child InstalledPackage) ! {
 	mut dest := os.join_path(store_node_modules_dir(parent), child.pkg.name)
@@ -59,6 +43,13 @@ fn ensure_file_link(target string, fallback_target string, dest string) ! {
 
 fn try_symlink_or_junction(target string, fallback_target string, dest string) bool {
 	os.symlink(target, dest) or {
+		if os.user_os() == 'windows' {
+			junction_cmd := 'cmd /c mklink /J "${dest}" "${windows_abs_path(fallback_target)}"'
+			junction_result := os.execute(junction_cmd)
+			if junction_result.exit_code == 0 {
+				return true
+			}
+		}
 		return false
 	}
 	return true
@@ -97,29 +88,8 @@ fn link_package_dir(src_dir string, dest_dir string) ! {
 fn link_path_recursive(src string, dest string) ! {
 	if os.is_dir(src) {
 		os.mkdir_all(dest)!
-		entries := os.ls(src)!
-		mut threads := []thread !{}
-
-		mut sema := unsafe { get_link_semaphore() }
-
-		for entry in entries {
-			s := os.join_path(src, entry)
-			d := os.join_path(dest, entry)
-
-			// We only spawn a thread if we can acquire the semaphore immediately (using try_wait).
-			// If not, we do the work synchronously to avoid creating too many threads and to prevent deadlocks.
-			if sema.try_wait() {
-				threads << spawn fn (s string, d string) ! {
-					mut sema := unsafe { get_link_semaphore() }
-					defer { sema.post() }
-					link_path_recursive(s, d)!
-				}(s, d)
-			} else {
-				link_path_recursive(s, d)!
-			}
-		}
-		for t in threads {
-			t.wait()!
+		for entry in os.ls(src)! {
+			link_path_recursive(os.join_path(src, entry), os.join_path(dest, entry))!
 		}
 		return
 	}
