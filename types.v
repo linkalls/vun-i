@@ -5,6 +5,7 @@ import sync
 const registry_url = 'https://registry.npmjs.org'
 
 struct PackageJson {
+	name         string
 	dependencies map[string]string
 }
 

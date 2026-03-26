@@ -58,7 +58,8 @@ fn resolve_all_dependencies(mut ctx InstallContext, root_deps map[string]string)
 	wg.add(num_workers)
 
 	for _ in 0 .. num_workers {
-		spawn fn (work_ch chan ResolvablePackage, mut state ResolveSharedState, mut wg sync.WaitGroup) {
+		spawn fn (work_ch chan ResolvablePackage, state_ptr &ResolveSharedState, mut wg sync.WaitGroup) {
+			mut state := unsafe { &ResolveSharedState(state_ptr) }
 			for {
 				item := <-work_ch or { break }
 				key := package_key(item.name, item.spec)
@@ -120,11 +121,11 @@ fn resolve_all_dependencies(mut ctx InstallContext, root_deps map[string]string)
 				}
 			}
 			wg.done()
-		}(work_ch, mut state, mut wg)
+		}(work_ch, &state, mut wg)
 	}
 	wg.wait()
 
-	ctx.resolved = state.resolved
+	ctx.resolved = state.resolved.clone()
 }
 
 fn resolve_dependency(mut ctx InstallContext, name string, spec string) !ResolvedPackage {

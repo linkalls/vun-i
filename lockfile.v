@@ -2,24 +2,10 @@ module main
 
 import os
 
-fn sync_bun_lockfile() {
-	bun_path := os.find_abs_path_of_executable('bun') or { '' }
-	if bun_path == '' {
-		println('⚠️ bun not found; skipped bun.lock generation')
-		return
+fn sync_bun_lockfile(root_manifest PackageJson, ctx InstallContext, cache_dir string) {
+	write_bun_lock(root_manifest, ctx, cache_dir) or {
+		eprintln('⚠️ failed to write bun.lock: ${err.msg()}')
 	}
-	println('🧾 syncing bun.lock via bun install --lockfile-only')
-	mut p := os.new_process(bun_path)
-	p.set_args(['install', '--lockfile-only'])
-	p.set_redirect_stdio()
-	p.run()
-	p.wait()
-	if p.code == 0 {
-		println('🟢 bun.lock synced')
-	} else {
-		eprintln('⚠️ bun lockfile sync failed')
-	}
-	p.close()
 }
 
 fn sync_npm_lockfile() {

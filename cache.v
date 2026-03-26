@@ -167,7 +167,13 @@ fn prefetch_package(pkg ResolvedPackage, cache_dir string, mut wg sync.WaitGroup
 		return
 	}
 
-	extract_tgz_native(resp.body.bytes(), cache_pkg_dir) or {
+	body := resp.body.bytes()
+
+	// Save integrity hash for native bun.lock generation.
+	integrity := sha512_integrity(body)
+	os.write_file(os.join_path(cache_pkg_dir, '.integrity'), integrity) or {}
+
+	extract_tgz_native(body, cache_pkg_dir) or {
 		eprintln('failed to extract ${pkg.name}@${pkg.version} (native): ${err.msg()}')
 		return
 	}
