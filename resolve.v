@@ -80,7 +80,7 @@ fn install_all_jobs(mut ctx InstallContext, jobs []InstallJob) ! {
 				}
 			}
 			wg.done()
-		}(task_ch, &link_wg)
+		}(task_ch, link_wg)
 	}
 
 	job_ch := chan InstallJob{cap: jobs.len + 1}

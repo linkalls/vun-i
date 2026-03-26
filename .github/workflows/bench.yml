@@ -61,7 +61,7 @@ jobs:
         run: v test store_test.v
 
       - name: Compile vun-i
-        run: v -prod -enable-globals -o vun.exe .
+        run: v -prod -o vun.exe .
 
       - name: Benchmark true-cold installs (3 runs)
         shell: powershell

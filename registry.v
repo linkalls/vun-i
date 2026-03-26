@@ -7,10 +7,6 @@ import runtime
 import sync
 import x.json2
 
-// In-memory registry metadata cache shared across all goroutines.
-__global registry_cache = map[string]NpmRegistry{}
-__global registry_cache_mu = sync.new_mutex()
-
 struct ResolvablePackage {
 	name string
 	spec string
@@ -18,9 +14,10 @@ struct ResolvablePackage {
 
 struct ResolveSharedState {
 mut:
-	resolved map[string]ResolvedPackage
-	pending  int
-	mu       &sync.Mutex = sync.new_mutex()
+	resolved       map[string]ResolvedPackage
+	registry_cache map[string]NpmRegistry
+	pending        int
+	mu             &sync.Mutex = sync.new_mutex()
 }
 
 // done decrements the pending counter and closes the channel when all work is finished.
@@ -76,10 +73,21 @@ fn resolve_all_dependencies(mut ctx InstallContext, root_deps map[string]string,
 					continue
 				}
 
-				registry := fetch_registry(item.name, cache_dir) or {
-					state.done(work_ch)
-					continue
+				// Check in-memory registry cache before hitting disk/network.
+				state.mu.@lock()
+				in_cache := item.name in state.registry_cache
+				mut registry := if in_cache { state.registry_cache[item.name] } else { NpmRegistry{} }
+				state.mu.unlock()
+				if !in_cache {
+					registry = fetch_registry(item.name, cache_dir) or {
+						state.done(work_ch)
+						continue
+					}
+					state.mu.@lock()
+					state.registry_cache[item.name] = registry
+					state.mu.unlock()
 				}
+
 				version := pick_version(registry, item.spec) or {
 					state.done(work_ch)
 					continue
@@ -163,30 +171,18 @@ fn resolve_dependency(mut ctx InstallContext, name string, spec string, cache_di
 }
 
 fn fetch_registry(name string, cache_dir string) !NpmRegistry {
-	// 1. Check in-memory cache first (fastest path for warm installs).
-	registry_cache_mu.@lock()
-	if name in registry_cache {
-		cached := registry_cache[name]
-		registry_cache_mu.unlock()
-		return cached
-	}
-	registry_cache_mu.unlock()
-
-	// 2. Check disk cache to avoid re-fetching on warm runs.
+	// 1. Check disk cache to avoid re-fetching on warm runs.
 	safe_name := name.replace('/', '+')
 	disk_path := os.join_path(cache_dir, 'registry', '${safe_name}.json')
 	if os.exists(disk_path) {
 		if data := os.read_file(disk_path) {
 			if reg := json.decode(NpmRegistry, data) {
-				registry_cache_mu.@lock()
-				registry_cache[name] = reg
-				registry_cache_mu.unlock()
 				return reg
 			}
 		}
 	}
 
-	// 3. Fetch from registry and persist to disk + memory.
+	// 2. Fetch from registry and persist to disk.
 	url := '${registry_url}/${name}'
 	resp := http.get(url)!
 	if resp.status_code != 200 {
@@ -194,11 +190,7 @@ fn fetch_registry(name string, cache_dir string) !NpmRegistry {
 	}
 	os.mkdir_all(os.dir(disk_path)) or {}
 	os.write_file(disk_path, resp.body) or {}
-	reg := json.decode(NpmRegistry, resp.body)!
-	registry_cache_mu.@lock()
-	registry_cache[name] = reg
-	registry_cache_mu.unlock()
-	return reg
+	return json.decode(NpmRegistry, resp.body)!
 }
 
 fn pick_version(registry NpmRegistry, spec string) !string {
