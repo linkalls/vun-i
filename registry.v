@@ -3,11 +3,129 @@ module main
 import json
 import net.http
 import os
+import runtime
+import sync
 import x.json2
+
+struct ResolvablePackage {
+	name string
+	spec string
+}
+
+struct ResolveSharedState {
+mut:
+	resolved map[string]ResolvedPackage
+	pending  int
+	mu       &sync.Mutex = sync.new_mutex()
+}
+
+// done decrements the pending counter and closes the channel when all work is finished.
+fn (mut s ResolveSharedState) done(work_ch chan ResolvablePackage) {
+	s.mu.@lock()
+	s.pending--
+	should_close := s.pending == 0
+	s.mu.unlock()
+	if should_close {
+		work_ch.close()
+	}
+}
 
 fn read_package_json(path string) !PackageJson {
 	data := os.read_file(path)!
 	return json.decode(PackageJson, data)!
+}
+
+fn resolve_all_dependencies(mut ctx InstallContext, root_deps map[string]string) ! {
+	if root_deps.len == 0 {
+		return
+	}
+
+	// Buffer sized to hold a large dependency graph without blocking producers.
+	work_ch := chan ResolvablePackage{cap: 2048}
+
+	mut state := ResolveSharedState{
+		resolved: ctx.resolved.clone()
+		pending:  root_deps.len
+	}
+
+	for name, spec in root_deps {
+		work_ch <- ResolvablePackage{name, spec}
+	}
+
+	// Use more workers than CPUs for network I/O-bound resolution.
+	num_workers := runtime.nr_cpus() * 4
+	mut wg := sync.new_waitgroup()
+	wg.add(num_workers)
+
+	for _ in 0 .. num_workers {
+		spawn fn (work_ch chan ResolvablePackage, state_ptr &ResolveSharedState, mut wg sync.WaitGroup) {
+			mut state := unsafe { &ResolveSharedState(state_ptr) }
+			for {
+				item := <-work_ch or { break }
+				key := package_key(item.name, item.spec)
+
+				state.mu.@lock()
+				already_resolved := key in state.resolved
+				state.mu.unlock()
+				if already_resolved {
+					state.done(work_ch)
+					continue
+				}
+
+				registry := fetch_registry(item.name) or {
+					state.done(work_ch)
+					continue
+				}
+				version := pick_version(registry, item.spec) or {
+					state.done(work_ch)
+					continue
+				}
+				version_meta := registry.versions[version]
+				if version_meta.dist.tarball == '' {
+					state.done(work_ch)
+					continue
+				}
+
+				resolved := ResolvedPackage{
+					name:              item.name
+					version:           version
+					tarball:           version_meta.dist.tarball
+					dependencies:      version_meta.dependencies.clone()
+					peer_dependencies: version_meta.peer_dependencies.clone()
+					bin:               version_meta.bin.clone()
+				}
+
+				mut new_deps := []ResolvablePackage{}
+				state.mu.@lock()
+				if key !in state.resolved {
+					state.resolved[key] = resolved
+					for dep_name, dep_spec in resolved.dependencies {
+						dep_key := package_key(dep_name, dep_spec)
+						if dep_key !in state.resolved {
+							// Increment before enqueue so done() can't close prematurely.
+							state.pending++
+							new_deps << ResolvablePackage{dep_name, dep_spec}
+						}
+					}
+				}
+				state.pending--
+				should_close := state.pending == 0
+				state.mu.unlock()
+
+				for dep in new_deps {
+					work_ch <- dep
+				}
+
+				if should_close {
+					work_ch.close()
+				}
+			}
+			wg.done()
+		}(work_ch, &state, mut wg)
+	}
+	wg.wait()
+
+	ctx.resolved = state.resolved.clone()
 }
 
 fn resolve_dependency(mut ctx InstallContext, name string, spec string) !ResolvedPackage {

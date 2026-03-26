@@ -2,18 +2,9 @@ module main
 
 import os
 
-fn sync_bun_lockfile() {
-	bun_path := os.find_abs_path_of_executable('bun') or { '' }
-	if bun_path == '' {
-		println('⚠️ bun not found; skipped bun.lock generation')
-		return
-	}
-	println('🧾 syncing bun.lock via bun install --lockfile-only')
-	result := os.execute('bun install --lockfile-only')
-	if result.exit_code == 0 {
-		println('🟢 bun.lock synced')
-	} else {
-		eprintln('⚠️ bun lockfile sync failed: ${result.output}')
+fn sync_bun_lockfile(root_manifest PackageJson, ctx InstallContext, cache_dir string) {
+	write_bun_lock(root_manifest, ctx, cache_dir) or {
+		eprintln('⚠️ failed to write bun.lock: ${err.msg()}')
 	}
 }
 
@@ -24,11 +15,16 @@ fn sync_npm_lockfile() {
 		return
 	}
 	println('🧾 syncing package-lock.json via npm install --package-lock-only')
-	result := os.execute('npm install --package-lock-only')
-	if result.exit_code == 0 {
+	mut p := os.new_process(npm_path)
+	p.set_args(['install', '--package-lock-only'])
+	p.set_redirect_stdio()
+	p.run()
+	p.wait()
+	if p.code == 0 {
 		println('🟢 package-lock.json synced')
 	} else {
-		eprintln('⚠️ npm lockfile sync failed: ${result.output}')
+		eprintln('⚠️ npm lockfile sync failed')
 	}
+	p.close()
 }
 

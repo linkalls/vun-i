@@ -1,38 +1,103 @@
 module main
 
 import os
+import runtime
+import sync
 
-fn install_package_direct(mut ctx InstallContext, cache_dir string, installed_pkg InstalledPackage, providers map[string]ResolvedPackage) ! {
-	store_key := store_key_for(installed_pkg)
-	ctx.mu.@lock()
-	if store_key in ctx.installed {
-		ctx.mu.unlock()
+struct InstallJob {
+	installed_pkg InstalledPackage
+	providers     map[string]ResolvedPackage
+	cache_dir     string
+}
+
+// collect_install_jobs performs a BFS over the dependency graph and returns a
+// deduplicated, flat list of all packages that need to be hardlinked.
+fn collect_install_jobs(ctx &InstallContext, cache_dir string, root_deps map[string]ResolvedPackage) []InstallJob {
+	mut jobs := []InstallJob{}
+	mut visited := map[string]bool{}
+	mut queue := []InstallJob{}
+
+	for _, pkg in root_deps {
+		root_peers := select_matching_peers(pkg.peer_dependencies, root_deps)
+		installed := InstalledPackage{pkg, root_peers}
+		key := store_key_for(installed)
+		if key in visited {
+			continue
+		}
+		visited[key] = true
+		providers := providers_for_child(root_deps, installed)
+		queue << InstallJob{installed, providers, cache_dir}
+	}
+
+	for queue.len > 0 {
+		job := queue[0]
+		queue = queue[1..]
+		jobs << job
+
+		child_providers := providers_for_child(job.providers, job.installed_pkg)
+		for dep_name, dep_spec in job.installed_pkg.pkg.dependencies {
+			dep := resolved_by_exact_key(*ctx, dep_name, dep_spec) or {
+				first_resolved_for_name(*ctx, dep_name) or { continue }
+			}
+			dep_peers := select_matching_peers(dep.peer_dependencies, child_providers)
+			child := InstalledPackage{dep, dep_peers}
+			child_key := store_key_for(child)
+			if child_key in visited {
+				continue
+			}
+			visited[child_key] = true
+			queue << InstallJob{child, child_providers, cache_dir}
+		}
+	}
+	return jobs
+}
+
+// install_all_jobs processes all hardlink jobs using a bounded worker pool.
+fn install_all_jobs(mut ctx InstallContext, jobs []InstallJob) ! {
+	if jobs.len == 0 {
 		return
 	}
-	ctx.installed[store_key] = true
-	ctx.mu.unlock()
-
-	source_dir := package_cache_dir(cache_dir, installed_pkg.pkg)
-	dest_dir := os.join_path('node_modules', installed_pkg.pkg.name)
-
-	if !os.exists(dest_dir) {
-		hardlink_dir_parallel(source_dir, dest_dir)!
+	job_ch := chan InstallJob{cap: jobs.len + 1}
+	for job in jobs {
+		job_ch <- job
 	}
-	link_root_bins(installed_pkg)!
+	job_ch.close()
 
-	child_providers := providers_for_child(providers, installed_pkg)
-	mut threads := []thread !{}
-	for dep_name, dep_spec in installed_pkg.pkg.dependencies {
-		dep := resolved_by_exact_key(ctx, dep_name, dep_spec) or {
-			first_resolved_for_name(ctx, dep_name)!
-		}
-		dep_peers := select_matching_peers(dep.peer_dependencies, child_providers)
-		child := InstalledPackage{dep, dep_peers}
-		threads << spawn install_package_direct(mut ctx, cache_dir, child, child_providers)
+	num_workers := runtime.nr_cpus() * 2
+	mut wg := sync.new_waitgroup()
+	wg.add(num_workers)
+
+	for _ in 0 .. num_workers {
+		spawn fn (job_ch chan InstallJob, install_ctx_ptr &InstallContext, mut wg sync.WaitGroup) {
+			mut lctx := unsafe { &InstallContext(install_ctx_ptr) }
+			for {
+				job := <-job_ch or { break }
+				source_dir := package_cache_dir(job.cache_dir, job.installed_pkg.pkg)
+				dest_dir := os.join_path('node_modules', job.installed_pkg.pkg.name)
+
+				lctx.mu.@lock()
+				key := store_key_for(job.installed_pkg)
+				already := key in lctx.installed
+				if !already {
+					lctx.installed[key] = true
+				}
+				lctx.mu.unlock()
+				if already {
+					continue
+				}
+
+				if !os.exists(dest_dir) {
+					hardlink_tree(source_dir, dest_dir) or {
+						eprintln('⚠️ hardlink failed for ${job.installed_pkg.pkg.name}: ${err.msg()}')
+						continue
+					}
+				}
+				link_root_bins(job.installed_pkg) or {}
+			}
+			wg.done()
+		}(job_ch, &ctx, mut wg)
 	}
-	for t in threads {
-		t.wait()!
-	}
+	wg.wait()
 }
 
 fn select_matching_peers(peer_specs map[string]string, providers map[string]ResolvedPackage) map[string]ResolvedPackage {

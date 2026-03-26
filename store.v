@@ -8,7 +8,7 @@ fn store_key_for(installed_pkg InstalledPackage) string {
 
 fn store_folder_name(installed_pkg InstalledPackage) string {
 	peer_suffix := peer_hash_suffix(installed_pkg.peers)
-	base_name := installed_pkg.pkg.name.replace('/', '+').replace('@', '@')
+	base_name := installed_pkg.pkg.name.replace('/', '+')
 	return '${base_name}@${installed_pkg.pkg.version}${peer_suffix}'
 }
 
