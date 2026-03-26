@@ -52,23 +52,52 @@ fn collect_install_jobs(ctx &InstallContext, cache_dir string, root_deps map[str
 	return jobs
 }
 
-// install_all_jobs processes all hardlink jobs using a bounded worker pool.
+// install_all_jobs processes all hardlink jobs using a single global worker pool.
+// Hardlink tasks from all packages are drained by one shared pool of workers,
+// eliminating the per-package thread create/destroy overhead.
+// Bin linking is deferred to a second pass after all hardlinks complete.
 fn install_all_jobs(mut ctx InstallContext, jobs []InstallJob) ! {
 	if jobs.len == 0 {
 		return
 	}
+
+	// Single global hardlink worker pool shared across all packages.
+	// Buffer sized to ~64 files per package to avoid blocking collectors.
+	task_ch := chan HardlinkTask{cap: jobs.len * 64 + 256}
+	num_link_workers := runtime.nr_cpus() * 2
+	mut link_wg := sync.new_waitgroup()
+	link_wg.add(num_link_workers)
+	for _ in 0 .. num_link_workers {
+		spawn fn (task_ch chan HardlinkTask, wg_ptr &sync.WaitGroup) {
+			mut wg := unsafe { &sync.WaitGroup(wg_ptr) }
+			for {
+				task := <-task_ch or { break }
+				os.mkdir_all(os.dir(task.dest)) or {}
+				os.link(task.src, task.dest) or {
+					os.cp(task.src, task.dest) or {
+						eprintln('⚠️ failed to link or copy ${task.src}: ${err.msg()}')
+					}
+				}
+			}
+			wg.done()
+		}(task_ch, link_wg)
+	}
+
 	job_ch := chan InstallJob{cap: jobs.len + 1}
 	for job in jobs {
 		job_ch <- job
 	}
 	job_ch.close()
 
+	// Collect packages that need bin linking after hardlinks complete.
+	bin_ch := chan InstalledPackage{cap: jobs.len}
+
 	num_workers := runtime.nr_cpus() * 2
 	mut wg := sync.new_waitgroup()
 	wg.add(num_workers)
 
 	for _ in 0 .. num_workers {
-		spawn fn (job_ch chan InstallJob, install_ctx_ptr &InstallContext, mut wg sync.WaitGroup) {
+		spawn fn (job_ch chan InstallJob, install_ctx_ptr &InstallContext, task_ch chan HardlinkTask, bin_ch chan InstalledPackage, mut wg sync.WaitGroup) {
 			mut lctx := unsafe { &InstallContext(install_ctx_ptr) }
 			for {
 				job := <-job_ch or { break }
@@ -87,17 +116,28 @@ fn install_all_jobs(mut ctx InstallContext, jobs []InstallJob) ! {
 				}
 
 				if !os.exists(dest_dir) {
-					hardlink_tree(source_dir, dest_dir) or {
+					hardlink_tree(source_dir, dest_dir, task_ch) or {
 						eprintln('⚠️ hardlink failed for ${job.installed_pkg.pkg.name}: ${err.msg()}')
 						continue
 					}
 				}
-				link_root_bins(job.installed_pkg) or {}
+				bin_ch <- job.installed_pkg
 			}
 			wg.done()
-		}(job_ch, &ctx, mut wg)
+		}(job_ch, &ctx, task_ch, bin_ch, mut wg)
 	}
 	wg.wait()
+
+	// All hardlink tasks are now enqueued; drain the pool before linking bins.
+	task_ch.close()
+	link_wg.wait()
+
+	// Second pass: link bins now that all hardlinks are in place.
+	bin_ch.close()
+	for {
+		installed_pkg := <-bin_ch or { break }
+		link_root_bins(installed_pkg) or {}
+	}
 }
 
 fn select_matching_peers(peer_specs map[string]string, providers map[string]ResolvedPackage) map[string]ResolvedPackage {

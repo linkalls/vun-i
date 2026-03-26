@@ -62,7 +62,7 @@ fn main() {
 		installed:         map[string]bool{}
 	}
 
-	resolve_all_dependencies(mut ctx, root_manifest.dependencies) or {
+	resolve_all_dependencies(mut ctx, root_manifest.dependencies, cache_dir) or {
 		eprintln('❌ failed to resolve dependencies: ${err.msg()}')
 		return
 	}

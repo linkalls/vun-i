@@ -14,9 +14,10 @@ struct ResolvablePackage {
 
 struct ResolveSharedState {
 mut:
-	resolved map[string]ResolvedPackage
-	pending  int
-	mu       &sync.Mutex = sync.new_mutex()
+	resolved       map[string]ResolvedPackage
+	registry_cache map[string]NpmRegistry
+	pending        int
+	mu             &sync.Mutex = sync.new_mutex()
 }
 
 // done decrements the pending counter and closes the channel when all work is finished.
@@ -35,13 +36,13 @@ fn read_package_json(path string) !PackageJson {
 	return json.decode(PackageJson, data)!
 }
 
-fn resolve_all_dependencies(mut ctx InstallContext, root_deps map[string]string) ! {
+fn resolve_all_dependencies(mut ctx InstallContext, root_deps map[string]string, cache_dir string) ! {
 	if root_deps.len == 0 {
 		return
 	}
 
 	// Buffer sized to hold a large dependency graph without blocking producers.
-	work_ch := chan ResolvablePackage{cap: 2048}
+	work_ch := chan ResolvablePackage{cap: root_deps.len * 64 + 1024}
 
 	mut state := ResolveSharedState{
 		resolved: ctx.resolved.clone()
@@ -58,7 +59,7 @@ fn resolve_all_dependencies(mut ctx InstallContext, root_deps map[string]string)
 	wg.add(num_workers)
 
 	for _ in 0 .. num_workers {
-		spawn fn (work_ch chan ResolvablePackage, state_ptr &ResolveSharedState, mut wg sync.WaitGroup) {
+		spawn fn (work_ch chan ResolvablePackage, state_ptr &ResolveSharedState, cache_dir string, mut wg sync.WaitGroup) {
 			mut state := unsafe { &ResolveSharedState(state_ptr) }
 			for {
 				item := <-work_ch or { break }
@@ -72,10 +73,21 @@ fn resolve_all_dependencies(mut ctx InstallContext, root_deps map[string]string)
 					continue
 				}
 
-				registry := fetch_registry(item.name) or {
-					state.done(work_ch)
-					continue
+				// Check in-memory registry cache before hitting disk/network.
+				state.mu.@lock()
+				in_cache := item.name in state.registry_cache
+				mut registry := if in_cache { state.registry_cache[item.name] } else { NpmRegistry{} }
+				state.mu.unlock()
+				if !in_cache {
+					registry = fetch_registry(item.name, cache_dir) or {
+						state.done(work_ch)
+						continue
+					}
+					state.mu.@lock()
+					state.registry_cache[item.name] = registry
+					state.mu.unlock()
 				}
+
 				version := pick_version(registry, item.spec) or {
 					state.done(work_ch)
 					continue
@@ -121,20 +133,20 @@ fn resolve_all_dependencies(mut ctx InstallContext, root_deps map[string]string)
 				}
 			}
 			wg.done()
-		}(work_ch, &state, mut wg)
+		}(work_ch, &state, cache_dir, mut wg)
 	}
 	wg.wait()
 
 	ctx.resolved = state.resolved.clone()
 }
 
-fn resolve_dependency(mut ctx InstallContext, name string, spec string) !ResolvedPackage {
+fn resolve_dependency(mut ctx InstallContext, name string, spec string, cache_dir string) !ResolvedPackage {
 	key := package_key(name, spec)
 	if key in ctx.resolved {
 		return ctx.resolved[key]
 	}
 
-	registry := fetch_registry(name)!
+	registry := fetch_registry(name, cache_dir)!
 	version := pick_version(registry, spec)!
 	version_meta := registry.versions[version]
 	if version_meta.dist.tarball == '' {
@@ -152,18 +164,32 @@ fn resolve_dependency(mut ctx InstallContext, name string, spec string) !Resolve
 	ctx.resolved[key] = resolved
 
 	for dep_name, dep_spec in resolved.dependencies {
-		resolve_dependency(mut ctx, dep_name, dep_spec)!
+		resolve_dependency(mut ctx, dep_name, dep_spec, cache_dir)!
 	}
 
 	return resolved
 }
 
-fn fetch_registry(name string) !NpmRegistry {
+fn fetch_registry(name string, cache_dir string) !NpmRegistry {
+	// 1. Check disk cache to avoid re-fetching on warm runs.
+	safe_name := name.replace('/', '+')
+	disk_path := os.join_path(cache_dir, 'registry', '${safe_name}.json')
+	if os.exists(disk_path) {
+		if data := os.read_file(disk_path) {
+			if reg := json.decode(NpmRegistry, data) {
+				return reg
+			}
+		}
+	}
+
+	// 2. Fetch from registry and persist to disk.
 	url := '${registry_url}/${name}'
 	resp := http.get(url)!
 	if resp.status_code != 200 {
 		return error('registry lookup failed for ${name}: HTTP ${resp.status_code}')
 	}
+	os.mkdir_all(os.dir(disk_path)) or {}
+	os.write_file(disk_path, resp.body) or {}
 	return json.decode(NpmRegistry, resp.body)!
 }
 
