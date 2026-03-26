@@ -134,19 +134,30 @@ fn prefetch_all(packages []ResolvedPackage, cache_dir string) {
 		return
 	}
 
-	mut wg := sync.new_waitgroup()
+	// Fill the channel before spawning workers so it never blocks.
+	pkg_ch := chan ResolvedPackage{cap: packages.len}
 	for pkg in packages {
-		wg.add(1)
-		spawn prefetch_package(pkg, cache_dir, mut wg)
+		pkg_ch <- pkg
+	}
+	pkg_ch.close()
+
+	// Cap concurrency to avoid saturating the TCP stack.
+	num_workers := if packages.len < 32 { packages.len } else { 32 }
+	mut wg := sync.new_waitgroup()
+	wg.add(num_workers)
+	for _ in 0 .. num_workers {
+		spawn fn (pkg_ch chan ResolvedPackage, cache_dir string, mut wg sync.WaitGroup) {
+			for {
+				pkg := <-pkg_ch or { break }
+				prefetch_package(pkg, cache_dir)
+			}
+			wg.done()
+		}(pkg_ch, cache_dir, mut wg)
 	}
 	wg.wait()
 }
 
-fn prefetch_package(pkg ResolvedPackage, cache_dir string, mut wg sync.WaitGroup) {
-	defer {
-		wg.done()
-	}
-
+fn prefetch_package(pkg ResolvedPackage, cache_dir string) {
 	cache_pkg_dir := package_cache_dir(cache_dir, pkg)
 	if os.exists(os.join_path(cache_pkg_dir, 'package.json')) {
 		return
