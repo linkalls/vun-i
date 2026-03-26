@@ -12,12 +12,23 @@ struct ResolvablePackage {
 	spec string
 }
 
+// NpmRegistryMeta holds only the lightweight per-package data needed to resolve
+// a spec to a concrete version: the dist-tags map and a sorted list of all
+// published version strings (newest-first). Individual NpmVersion metadata is
+// loaded separately via fetch_version_meta so warm runs never parse the full
+// 500 KB+ registry JSON.
+struct NpmRegistryMeta {
+	dist_tags    map[string]string
+	version_keys []string
+}
+
 struct ResolveSharedState {
 mut:
-	resolved       map[string]ResolvedPackage
-	registry_cache map[string]NpmRegistry
-	pending        int
-	mu             &sync.Mutex = sync.new_mutex()
+	resolved      map[string]ResolvedPackage
+	meta_cache    map[string]NpmRegistryMeta // keyed by package name
+	version_cache map[string]NpmVersion      // keyed by "name@version"
+	pending       int
+	mu            &sync.Mutex = sync.new_mutex()
 }
 
 // done decrements the pending counter and closes the channel when all work is finished.
@@ -73,26 +84,43 @@ fn resolve_all_dependencies(mut ctx InstallContext, root_deps map[string]string,
 					continue
 				}
 
-				// Check in-memory registry cache before hitting disk/network.
+				// Check in-memory meta cache (dist-tags + version list) before
+				// hitting disk/network.
 				state.mu.@lock()
-				in_cache := item.name in state.registry_cache
-				mut registry := if in_cache { state.registry_cache[item.name] } else { NpmRegistry{} }
+				has_meta := item.name in state.meta_cache
+				mut meta := if has_meta { state.meta_cache[item.name] } else { NpmRegistryMeta{} }
 				state.mu.unlock()
-				if !in_cache {
-					registry = fetch_registry(item.name, cache_dir) or {
+				if !has_meta {
+					meta = fetch_registry_meta(item.name, cache_dir) or {
 						state.done(work_ch)
 						continue
 					}
 					state.mu.@lock()
-					state.registry_cache[item.name] = registry
+					state.meta_cache[item.name] = meta
 					state.mu.unlock()
 				}
 
-				version := pick_version(registry, item.spec) or {
+				version := pick_version_from_meta(meta, item.spec) or {
 					state.done(work_ch)
 					continue
 				}
-				version_meta := registry.versions[version]
+
+				// Check in-memory version metadata cache.
+				ver_key := '${item.name}@${version}'
+				state.mu.@lock()
+				has_ver := ver_key in state.version_cache
+				mut version_meta := if has_ver { state.version_cache[ver_key] } else { NpmVersion{} }
+				state.mu.unlock()
+				if !has_ver {
+					version_meta = fetch_version_meta(item.name, version, cache_dir) or {
+						state.done(work_ch)
+						continue
+					}
+					state.mu.@lock()
+					state.version_cache[ver_key] = version_meta
+					state.mu.unlock()
+				}
+
 				if version_meta.dist.tarball == '' {
 					state.done(work_ch)
 					continue
@@ -146,9 +174,9 @@ fn resolve_dependency(mut ctx InstallContext, name string, spec string, cache_di
 		return ctx.resolved[key]
 	}
 
-	registry := fetch_registry(name, cache_dir)!
-	version := pick_version(registry, spec)!
-	version_meta := registry.versions[version]
+	meta := fetch_registry_meta(name, cache_dir)!
+	version := pick_version_from_meta(meta, spec)!
+	version_meta := fetch_version_meta(name, version, cache_dir)!
 	if version_meta.dist.tarball == '' {
 		return error('missing tarball for ${name}@${version}')
 	}
@@ -170,54 +198,153 @@ fn resolve_dependency(mut ctx InstallContext, name string, spec string, cache_di
 	return resolved
 }
 
-fn fetch_registry(name string, cache_dir string) !NpmRegistry {
-	// 1. Check disk cache to avoid re-fetching on warm runs.
+// registry_cache_dir returns the per-package directory inside the registry
+// cache: `{cache_dir}/registry/{safe_name}` where safe_name replaces `/` with
+// `+` so that scoped packages (`@scope/pkg`) don't create nested dirs.
+fn registry_cache_dir(cache_dir string, name string) string {
 	safe_name := name.replace('/', '+')
-	disk_path := os.join_path(cache_dir, 'registry', '${safe_name}.json')
-	if os.exists(disk_path) {
-		if data := os.read_file(disk_path) {
-			if reg := json.decode(NpmRegistry, data) {
-				return reg
+	return os.join_path(cache_dir, 'registry', safe_name)
+}
+
+// fetch_registry_meta returns the lightweight NpmRegistryMeta for a package
+// (dist-tags and the sorted list of all published version strings).
+//
+// Disk cache layout (new format):
+//   {cache_dir}/registry/{safe_name}/dist-tags.json  — map[string]string
+//   {cache_dir}/registry/{safe_name}/versions.json   — []string (newest-first)
+//
+// Migration: if the old single-file cache
+//   {cache_dir}/registry/{safe_name}.json
+// is present it is parsed and the new split files are written from it, so
+// users upgrading do not trigger an extra network round-trip.
+fn fetch_registry_meta(name string, cache_dir string) !NpmRegistryMeta {
+	reg_dir := registry_cache_dir(cache_dir, name)
+	dt_path := os.join_path(reg_dir, 'dist-tags.json')
+	ver_path := os.join_path(reg_dir, 'versions.json')
+
+	// 1. Fast path: both slim files already exist.
+	if os.exists(dt_path) && os.exists(ver_path) {
+		dt_data := os.read_file(dt_path) or { '' }
+		ver_data := os.read_file(ver_path) or { '' }
+		if dt_data != '' && ver_data != '' {
+			dist_tags := json.decode(map[string]string, dt_data) or { map[string]string{} }
+			version_keys := json.decode([]string, ver_data) or { []string{} }
+			if version_keys.len > 0 {
+				return NpmRegistryMeta{
+					dist_tags:    dist_tags
+					version_keys: version_keys
+				}
 			}
 		}
 	}
 
-	// 2. Fetch from registry and persist to disk.
+	// 2. Migration path: old single-file cache exists — split it without a
+	//    network request.
+	safe_name := name.replace('/', '+')
+	old_path := os.join_path(cache_dir, 'registry', '${safe_name}.json')
+	if os.exists(old_path) {
+		if data := os.read_file(old_path) {
+			if full_reg := json.decode(NpmRegistry, data) {
+				meta := write_split_registry_cache(full_reg, reg_dir)
+				if meta.version_keys.len > 0 {
+					return meta
+				}
+			}
+		}
+	}
+
+	// 3. Cold path: fetch the full packument from npm and persist split files.
 	url := '${registry_url}/${name}'
 	resp := http.get(url)!
 	if resp.status_code != 200 {
 		return error('registry lookup failed for ${name}: HTTP ${resp.status_code}')
 	}
-	os.mkdir_all(os.dir(disk_path)) or {}
-	os.write_file(disk_path, resp.body) or {}
-	return json.decode(NpmRegistry, resp.body)!
+	full_reg := json.decode(NpmRegistry, resp.body)!
+	return write_split_registry_cache(full_reg, reg_dir)
 }
 
-fn pick_version(registry NpmRegistry, spec string) !string {
+// write_split_registry_cache persists the slim files from a full NpmRegistry
+// and returns the resulting NpmRegistryMeta.  Individual version JSON files are
+// also written here so that subsequent fetch_version_meta calls hit disk only.
+// Write failures are silently swallowed — the in-memory meta is always returned.
+fn write_split_registry_cache(full_reg NpmRegistry, reg_dir string) NpmRegistryMeta {
+	os.mkdir_all(reg_dir) or {}
+
+	// Write dist-tags.
+	dt_path := os.join_path(reg_dir, 'dist-tags.json')
+	os.write_file(dt_path, json.encode(full_reg.dist_tags)) or {}
+
+	// Build sorted version list (newest first) and write it.
+	mut keys := full_reg.versions.keys()
+	keys.sort_with_compare(fn (a &string, b &string) int {
+		return compare_semver_desc(*a, *b)
+	})
+	ver_path := os.join_path(reg_dir, 'versions.json')
+	os.write_file(ver_path, json.encode(keys)) or {}
+
+	// Write per-version slim files so warm runs never need to re-parse the
+	// full packument.
+	for ver_str, ver_meta in full_reg.versions {
+		vpath := os.join_path(reg_dir, '${ver_str}.json')
+		os.write_file(vpath, json.encode(ver_meta)) or {}
+	}
+
+	return NpmRegistryMeta{
+		dist_tags:    full_reg.dist_tags
+		version_keys: keys
+	}
+}
+
+// fetch_version_meta returns the NpmVersion metadata for a specific resolved
+// version.  On warm runs the slim per-version file is read from disk; on cold
+// runs (or when the per-version file is absent) the single-version npm endpoint
+// is used so only one small JSON response is needed rather than the full
+// packument.
+fn fetch_version_meta(name string, version string, cache_dir string) !NpmVersion {
+	reg_dir := registry_cache_dir(cache_dir, name)
+	vpath := os.join_path(reg_dir, '${version}.json')
+
+	// 1. Warm path: slim version file exists on disk.
+	if os.exists(vpath) {
+		data := os.read_file(vpath) or { '' }
+		if data != '' {
+			if ver_meta := json.decode(NpmVersion, data) {
+				return ver_meta
+			}
+		}
+	}
+
+	// 2. Cold path: fetch the single-version packument.
+	url := '${registry_url}/${name}/${version}'
+	resp := http.get(url)!
+	if resp.status_code != 200 {
+		return error('registry version lookup failed for ${name}@${version}: HTTP ${resp.status_code}')
+	}
+	os.mkdir_all(reg_dir) or {}
+	os.write_file(vpath, resp.body) or {}
+	return json.decode(NpmVersion, resp.body)!
+}
+
+// pick_version_from_meta resolves a dependency spec to a concrete version
+// string using only the lightweight NpmRegistryMeta (dist-tags + version list).
+fn pick_version_from_meta(meta NpmRegistryMeta, spec string) !string {
 	trimmed := spec.trim_space()
 	if trimmed == '' {
 		return error('empty version spec')
 	}
-	if trimmed in registry.versions {
-		return trimmed
+	// Dist-tag match first — O(1) map lookup, handles the common 'latest' case.
+	if trimmed in meta.dist_tags {
+		return meta.dist_tags[trimmed]
 	}
-	if trimmed in registry.dist_tags {
-		return registry.dist_tags[trimmed]
-	}
-
-	mut candidates := []string{}
-	for version, _ in registry.versions {
-		if version_matches_spec(version, trimmed) {
-			candidates << version
+	// Single O(n) pass through version_keys (pre-sorted newest-first).  An
+	// exact version match (vk == trimmed) is caught by version_matches_spec
+	// too, so no separate loop is needed.  The first match is the best one.
+	for vk in meta.version_keys {
+		if version_matches_spec(vk, trimmed) {
+			return vk
 		}
 	}
-	if candidates.len == 0 {
-		return error('no version matched spec ${spec}')
-	}
-	candidates.sort_with_compare(fn (a &string, b &string) int {
-		return compare_semver_desc(*a, *b)
-	})
-	return candidates[0]
+	return error('no version matched spec ${spec}')
 }
 
 fn version_matches_spec(version string, spec string) bool {
