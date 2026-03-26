@@ -9,12 +9,17 @@ fn sync_bun_lockfile() {
 		return
 	}
 	println('🧾 syncing bun.lock via bun install --lockfile-only')
-	result := os.execute('bun install --lockfile-only')
-	if result.exit_code == 0 {
+	mut p := os.new_process(bun_path)
+	p.set_args(['install', '--lockfile-only'])
+	p.set_redirect_stdio()
+	p.run()
+	p.wait()
+	if p.code == 0 {
 		println('🟢 bun.lock synced')
 	} else {
-		eprintln('⚠️ bun lockfile sync failed: ${result.output}')
+		eprintln('⚠️ bun lockfile sync failed')
 	}
+	p.close()
 }
 
 fn sync_npm_lockfile() {
@@ -24,11 +29,16 @@ fn sync_npm_lockfile() {
 		return
 	}
 	println('🧾 syncing package-lock.json via npm install --package-lock-only')
-	result := os.execute('npm install --package-lock-only')
-	if result.exit_code == 0 {
+	mut p := os.new_process(npm_path)
+	p.set_args(['install', '--package-lock-only'])
+	p.set_redirect_stdio()
+	p.run()
+	p.wait()
+	if p.code == 0 {
 		println('🟢 package-lock.json synced')
 	} else {
-		eprintln('⚠️ npm lockfile sync failed: ${result.output}')
+		eprintln('⚠️ npm lockfile sync failed')
 	}
+	p.close()
 }
 

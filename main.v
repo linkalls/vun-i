@@ -60,12 +60,17 @@ fn main() {
 		installed:         map[string]bool{}
 	}
 
-	for name, spec in root_manifest.dependencies {
-		resolved := resolve_dependency(mut ctx, name, spec) or {
-			eprintln('❌ failed to resolve ${name}@${spec}: ${err.msg()}')
+	resolve_all_dependencies(mut ctx, root_manifest.dependencies) or {
+		eprintln('❌ failed to resolve dependencies: ${err.msg()}')
+		return
+	}
+
+	for name, _ in root_manifest.dependencies {
+		pkg := first_resolved_for_name(ctx, name) or {
+			eprintln('❌ missing resolved package for ${name}')
 			return
 		}
-		ctx.root_dependencies[name] = resolved
+		ctx.root_dependencies[name] = pkg
 	}
 
 	println('📦 resolved ${ctx.resolved.len} packages')

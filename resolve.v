@@ -16,7 +16,7 @@ fn install_package_direct(mut ctx InstallContext, cache_dir string, installed_pk
 	dest_dir := os.join_path('node_modules', installed_pkg.pkg.name)
 
 	if !os.exists(dest_dir) {
-		hardlink_dir_parallel(source_dir, dest_dir)!
+		hardlink_tree(source_dir, dest_dir)!
 	}
 	link_root_bins(installed_pkg)!
 
